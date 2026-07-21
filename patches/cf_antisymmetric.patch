@@ -1,0 +1,207 @@
+diff --git a/src/dla/cf.hpp b/src/dla/cf.hpp
+index b6c06c8..56c9f4a 100644
+--- a/src/dla/cf.hpp
++++ b/src/dla/cf.hpp
+@@ -44,15 +44,20 @@ class CF {
+   Accumulator SIGN;
+   std::vector<std::vector<Accumulator> > ACC;
+   std::vector<std::vector<Accumulator> > PHY;
++  // Antisymmetric channel: the same histogram weighted by the worm-head type,
++  // giving (G^{+-} - G^{-+})/2 where ACC gives (G^{+-} + G^{-+})/2.
++  std::vector<std::vector<Accumulator> > ACC_A;
++  std::vector<std::vector<Accumulator> > PHY_A;
+ 
+   std::vector<std::vector<int> > counter;
++  std::vector<std::vector<int> > counterA;
+ 
+  public:
+   CF(Parameter const& param, Lattice& lat, Algorithm& alg, Displacement& disp);
+   void setinit();
+   void reset();
+   void count(double tT, double bT, int head_site, int tail_site,
+-             double tail_tau);
++             double tail_tau, int headtype);
+   void accumulate(int NCYC, double sgn);
+   void setsummary();
+   void summary();
+@@ -83,16 +88,23 @@ CF::CF(Parameter const& param, Lattice& lat, Algorithm& alg, Displacement& disp)
+     for (int i = 0; i < nkinds; i++) {
+       ACC.push_back(std::vector<Accumulator>(Ntau));
+       PHY.push_back(std::vector<Accumulator>(Ntau));
++      ACC_A.push_back(std::vector<Accumulator>(Ntau));
++      PHY_A.push_back(std::vector<Accumulator>(Ntau));
+       for (int it = 0; it < Ntau; it++) {
+         std::stringstream ss;
+         ss << "C" << i << "t" << it;
+         ACC[i][it].reset();
+         PHY[i][it].reset(ss.str());
++        std::stringstream sa;
++        sa << "A" << i << "t" << it;
++        ACC_A[i][it].reset();
++        PHY_A[i][it].reset(sa.str());
+       }
+     }
+ 
+     for (int i = 0; i < nkinds; i++) {
+       counter.push_back(std::vector<int>(Ntau));
++      counterA.push_back(std::vector<int>(Ntau));
+     }
+   }
+ }
+@@ -104,7 +116,10 @@ inline void CF::setinit() {
+   AutoDebugDump("CF::setinit");
+   SIGN.reset();
+   for (int i = 0; i < nkinds; i++)
+-    for (int itau = 0; itau < Ntau; itau++) ACC[i][itau].reset();
++    for (int itau = 0; itau < Ntau; itau++) {
++      ACC[i][itau].reset();
++      ACC_A[i][itau].reset();
++    }
+ }
+ 
+ inline void CF::show(FILE* F) {
+@@ -116,6 +131,9 @@ inline void CF::show(FILE* F) {
+     for (int it = 0; it < Ntau; it++) {
+       PHY[i][it].show(F, "R");
+     }
++    for (int it = 0; it < Ntau; it++) {
++      PHY_A[i][it].show(F, "R");
++    }
+     std::fprintf(F, "\n");
+   }
+ }
+@@ -128,8 +146,10 @@ inline void CF::accumulate(int NCYC, double sgn) {
+   SIGN.accumulate(sgn);
+   const double invNCYC = 1.0 / NCYC;
+   for (int icf = 0; icf < nkinds; icf++)
+-    for (int it = 0; it < Ntau; it++)
++    for (int it = 0; it < Ntau; it++) {
+       ACC[icf][it].accumulate(sgn * invNCYC * counter[icf][it]);
++      ACC_A[icf][it].accumulate(sgn * invNCYC * counterA[icf][it]);
++    }
+ }
+ 
+ inline void CF::summary() {
+@@ -138,11 +158,14 @@ inline void CF::summary() {
+   }
+   AutoDebugDump("CF::summary");
+   for (int i = 0; i < nkinds; i++)
+-    for (int itau = 0; itau < Ntau; itau++) PHY[i][itau].average();
++    for (int itau = 0; itau < Ntau; itau++) {
++      PHY[i][itau].average();
++      PHY_A[i][itau].average();
++    }
+ }
+ 
+ void CF::count(double tT, double bT, int head_site, int tail_site,
+-               double tail_tau) {
++               double tail_tau, int headtype) {
+   if (!to_be_calc) {
+     return;
+   }
+@@ -166,13 +189,16 @@ void CF::count(double tT, double bT, int head_site, int tail_site,
+   if (bTr <= tTr) {
+     for (int ktau = bTri; ktau <= tTri; ktau++) {
+       counter[icf][ktau % Ntau] += 1;
++      counterA[icf][ktau % Ntau] += headtype;
+     }
+   } else {
+     for (int ktau = 0; ktau <= tTri; ktau++) {
+       counter[icf][ktau] += 1;
++      counterA[icf][ktau] += headtype;
+     }
+     for (int ktau = bTri; ktau < Ntau; ktau++) {
+       counter[icf][ktau] += 1;
++      counterA[icf][ktau] += headtype;
+     }
+   }
+ 
+@@ -187,6 +213,7 @@ void CF::reset() {
+   for (int icf = 0; icf < nkinds; icf++) {
+     for (int it = 0; it < Ntau; it++) {
+       counter[icf][it] = 0;
++      counterA[icf][it] = 0;
+     }
+   }
+ }
+@@ -208,6 +235,8 @@ void CF::setsummary() {
+       for (int it = 0; it < Ntau; it++) {
+         ACC[icf][it].average();
+         PHY[icf][it].accumulate(invsign * ACC[icf][it].mean() * factor);
++        ACC_A[icf][it].average();
++        PHY_A[icf][it].accumulate(invsign * ACC_A[icf][it].mean() * factor);
+       }
+     }
+   }
+@@ -218,6 +247,7 @@ void CF::allreduce(MPI_Comm comm) {
+   for (int icf = 0; icf < nkinds; icf++) {
+     for (int it = 0; it < Ntau; it++) {
+       PHY[icf][it].allreduce(comm);
++      PHY_A[icf][it].allreduce(comm);
+     }
+   }
+ }
+@@ -227,6 +257,8 @@ void CF::save(std::ofstream& F) const {
+   Serialize::save(F, SIGN);
+   Serialize::save(F, ACC);
+   Serialize::save(F, PHY);
++  Serialize::save(F, ACC_A);
++  Serialize::save(F, PHY_A);
+ }
+ 
+ void CF::load(std::ifstream& F) {
+@@ -247,6 +279,8 @@ void CF::load(std::ifstream& F) {
+     }
+   }
+   Serialize::load(F, PHY);
++  Serialize::load(F, ACC_A);
++  Serialize::load(F, PHY_A);
+ }
+ 
+ #endif  // SRC_DLA_CF_HPP_
+diff --git a/src/dla/dla.cc b/src/dla/dla.cc
+index bb0ae22..2a287d9 100644
+--- a/src/dla/dla.cc
++++ b/src/dla/dla.cc
+@@ -432,6 +432,12 @@ double Simulation::UP_ONESTEP(bool thermalized) {
+ 
+   const int xinc = W.getXBEHIND();
+ 
++  // Worm-head operator type for this step: does the head raise (+1) or lower
++  // (-1) the spin across itself. Moving up, the traversed region below carries
++  // xinc and the segment ahead carries c_S.X(). Captured before the move,
++  // since both change as the head advances.
++  const int c_headtype = c_S.X() - xinc;
++
+   // Using a std::vector is slightly slower (1~5%) than using a raw pointer
+   // for some environment... X(
+   UniformInterval* UI = new UniformInterval[NCI];
+@@ -621,7 +627,7 @@ double Simulation::UP_ONESTEP(bool thermalized) {
+ 
+   if (thermalized) {
+     const int head_site = c_Site.id() - 1;
+-    cf.count(c_time + len, c_time, head_site, tail_site, tail_tau);
++    cf.count(c_time + len, c_time, head_site, tail_site, tail_tau, c_headtype);
+     ck.count((head_site - tail_site + LAT.NSITE) % LAT.NSITE, c_time + len,
+              c_time, tail_tau);
+   }
+@@ -648,6 +654,10 @@ double Simulation::DOWN_ONESTEP(bool thermalized) {
+ 
+   const int xinc = W.getXBEHIND();
+ 
++  // As in UP_ONESTEP, but the head came from above: the region above carries
++  // xinc and the segment ahead (below) carries c_S.X().
++  const int c_headtype = xinc - c_S.X();
++
+   // Using a std::vector is slightly slower (1~5%) than using a raw pointer
+   // for some environment... X(
+   UniformInterval* UI = new UniformInterval[NCI];
+@@ -835,7 +845,7 @@ double Simulation::DOWN_ONESTEP(bool thermalized) {
+ 
+   if (thermalized) {
+     const int head_site = c_Site.id() - 1;
+-    cf.count(c_time, c_time - len, head_site, tail_site, tail_tau);
++    cf.count(c_time, c_time - len, head_site, tail_site, tail_tau, c_headtype);
+     ck.count((head_site - tail_site + LAT.NSITE) % LAT.NSITE, c_time,
+              c_time - len, tail_tau);
+   }

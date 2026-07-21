@@ -1,0 +1,35 @@
+# Vendored engine and its build (reproduced by README + patches/)
+external_dsqss/
+dsqss_install/
+venv/
+
+# Simulation output and figures
+Data/
+Plots/
+*.hdf5
+
+# Scratch directories from runs and validation
+.qmc_work/
+.qmc_*/
+
+# Compiled artefacts and executables
+*.out
+*.o
+*.a
+*.so
+*.dylib
+__pycache__/
+*.pyc
+*.pyo
+
+# LaTeX build products (the .tex and .pdf are tracked)
+*.aux
+*.log
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# OS cruft
+.DS_Store
+**/.DS_Store

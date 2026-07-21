@@ -1,0 +1,809 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,
+            citecolor=blue!50!black]{hyperref}
+\usepackage{microtype}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  columns=fullflexible,
+  showstringspaces=false,
+}
+
+\newcommand{\Sp}{S^{+}}
+\newcommand{\Sm}{S^{-}}
+\newcommand{\Gpm}{G^{+-}}
+\newcommand{\Gmp}{G^{-+}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{Worldline Quantum Monte Carlo for Spin Systems}\\[0.3em]
+       \large Implementation, Estimator Corrections, and Validation}
+\author{Implementation notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes a quantum Monte Carlo (QMC) arm added alongside the
+Chebyshev Expansion Algorithm for Typicality (CET) codebase. The goal was to
+compute imaginary-time spin correlations
+$C^{ab}_{i}(\tau)=\langle S^a_i(\tau) S^b_0(0)\rangle$ on periodic Heisenberg
+lattices, including at finite longitudinal field, and to write the results in
+\emph{exactly} the HDF5 schema the Chebyshev code produces so that existing
+analysis scripts work unchanged. The QMC engine is DSQSS/DLA
+(continuous-time worldline QMC with directed-loop/worm updates), taken from the
+public release and wrapped in a thin conversion layer. Four non-obvious
+properties of the DSQSS estimators had to be identified and corrected before
+the output was physically correct; each was found empirically by comparison
+against exact diagonalization or against an exact symmetry, rather than
+assumed, and one of them required a small patch to the QMC engine itself. The
+final pipeline reproduces exact diagonalization to $\sim 10^{-4}$ for the $xx$,
+$zz$ and $xy$ components, at zero and finite field, for both signs of the
+coupling, in one, two and three dimensions.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+%======================================================================
+\section{Motivation and scope}
+
+\subsection{Why add QMC}
+
+The existing codebase computes dynamical and imaginary-time spin correlations
+using quantum typicality: random states in the full Hilbert space are evolved
+with a Chebyshev expansion, avoiding full diagonalization. The cost is still
+exponential in the number of spins $N$, since the state vector has $2^N$
+components; in practice this caps system sizes at roughly $N\lesssim 24$.
+
+Worldline QMC has polynomial cost in $N$ for sign-problem-free models. It is
+therefore complementary rather than competing: on the subset of models where it
+applies, it reaches system sizes far beyond the typicality method, and where the
+two overlap it provides an independent check on the typicality error bars.
+
+\subsection{What is in scope}
+
+QMC is applicable here to \textbf{periodic, bipartite} lattices --- chains,
+squares and cubes with even side lengths --- with uniform coupling $J$, either
+antiferromagnetic ($J>0$) or ferromagnetic ($J<0$), and an optional uniform
+longitudinal field $h_z$.
+
+Two limitations are structural and should be stated plainly:
+
+\begin{itemize}
+  \item \textbf{Sign problem.} Frustrated lattices, random-sign couplings, and
+    the antiferromagnetic fully-connected (Curie--Weiss) model all have a sign
+    problem and are out of reach at the inverse temperatures of interest. For
+    those models the Chebyshev typicality method remains the correct tool. A
+    guard in the code rejects non-bipartite lattices up front with an
+    explanation, rather than silently returning results spoiled by a
+    fluctuating sign.
+  \item \textbf{Imaginary time only.} QMC produces $C(\tau)$ for
+    $\tau\in[0,\beta)$. Real-time correlations would require numerical analytic
+    continuation, which is ill-conditioned and is not attempted here.
+\end{itemize}
+
+A \emph{transverse} field is also out of scope: it breaks the U(1) symmetry that
+the directed-loop worm update relies on.
+
+%======================================================================
+\section{Choice of engine}
+
+The engine is \textbf{DSQSS/DLA} version 2.0.6 (Discrete Space Quantum Systems
+Solver, directed-loop algorithm), developed at ISSP, University of Tokyo, and
+released under GPLv3.\footnote{%
+\url{https://github.com/issp-center-dev/dsqss}; described in Y.~Motoyama,
+K.~Yoshimi, A.~Masaki-Kato, T.~Kato and N.~Kawashima,
+\emph{Comput.\ Phys.\ Commun.} (2021), arXiv:2007.11329.}
+It implements continuous-time path-integral QMC with an on-the-fly directed-loop
+worm update, is MPI-parallel, and --- decisively for this application ---
+measures imaginary-time-resolved correlation functions rather than only static
+observables.
+
+The alternative considered was porting Sandvik's stochastic series expansion
+(SSE) reference implementation and writing the $\tau$-resolved estimators
+directly. That would have given more control but required implementing and
+validating the Monte Carlo core itself. DSQSS was preferred precisely because
+the sampling engine is already published and tested; the work then reduces to
+understanding what its estimators mean and converting them, which is a much
+smaller and more auditable surface. As it turned out, this still required one
+targeted patch to the engine (Section~\ref{sec:patch}).
+
+The vendored source lives in \code{external\_dsqss/}; everything under
+\code{qmc/} is the conversion layer written for this project.
+
+%======================================================================
+\section{Physics conventions}
+
+\subsection{The two Hamiltonians}
+
+The Chebyshev code implements
+\begin{equation}
+  H_{\text{CET}}
+  = \sum_{i<j} J_{ij}\, \mathbf{S}_i\!\cdot\!\mathbf{S}_j
+  \;+\; h_z \sum_i S^z_i ,
+  \label{eq:H_cet}
+\end{equation}
+so $J_{ij}>0$ is antiferromagnetic. DSQSS's predefined XXZ model is
+\begin{equation}
+  H_{\text{DSQSS}}
+  = \sum_{\langle ij\rangle}
+     \Bigl[ -J_z S^z_i S^z_j
+            -\tfrac{J_{xy}}{2}\bigl(\Sp_i \Sm_j + \Sm_i \Sp_j\bigr) \Bigr]
+    \;+\; D\sum_i (S^z_i)^2 \;-\; h \sum_i S^z_i .
+  \label{eq:H_dsqss}
+\end{equation}
+Matching \eqref{eq:H_cet} and \eqref{eq:H_dsqss} for the isotropic case gives the
+mapping used throughout:
+\begin{equation}
+  \boxed{\;J_z = J_{xy} = -J, \qquad h = -h_z, \qquad D = 0. \;}
+  \label{eq:mapping}
+\end{equation}
+For $S=1/2$ the single-ion term $D$ is a constant and is set to zero.
+
+\subsection{Correlation functions and their symmetries}
+
+The object of interest is
+\begin{equation}
+  C^{ab}_i(\tau) \;=\; \bigl\langle S^a_i(\tau)\, S^b_0(0) \bigr\rangle,
+  \qquad
+  S^a_i(\tau) = e^{\tau H} S^a_i e^{-\tau H},
+  \qquad \tau\in[0,\beta).
+\end{equation}
+
+At $h_z=0$ the isotropic model has full SU(2) symmetry, so
+$C^{xx}=C^{yy}=C^{zz}$ and all off-diagonal components vanish; a single number
+per $\tau$ carries all the information.
+
+At $h_z\neq0$ the symmetry is reduced to U(1) about the $z$ axis. Then
+\begin{equation}
+  C^{xx}=C^{yy}, \qquad C^{xy}=-C^{yx}, \qquad C^{zz} \text{ independent},
+\end{equation}
+with all other components zero, so four numbers per $\tau$ are needed. This is
+the layout written here in all cases, in the fixed order
+$[\,xx,\;xy,\;yx,\;zz\,]$, which coincides with the row order of symmetry class
+\code{C} in the Chebyshev code's \code{CorrelationTensor}
+(\code{Algorithm/Types/Tensors.h}).
+
+In imaginary time the components have a rigid reality and parity structure.
+Because $H$, $S^x$ and $S^z$ are real matrices in the $S^z$ basis while $S^y$ is
+purely imaginary:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Component & Real part & Imaginary part & Parity about $\beta/2$ \\
+\midrule
+$C^{zz}(\tau)$          & nonzero & $0$     & symmetric \\
+$C^{xx}=C^{yy}(\tau)$   & nonzero & $0$     & symmetric \\
+$C^{xy}=-C^{yx}(\tau)$  & $0$     & nonzero & antisymmetric \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The antisymmetry $C^{xy}(\beta-\tau) = -C^{xy}(\tau)$ is worth emphasising: it is
+the imaginary-time image of Larmor precession, it is nonzero \emph{only} at
+finite field, and it is the reason the ``imaginary part'' of the output file is
+not identically zero once a field is applied. It also means any code that
+mirrors data from $[0,\beta/2]$ to $[0,\beta]$ must flip the sign for this
+component.
+
+These structural facts are used as internal consistency checks throughout the
+validation.
+
+%======================================================================
+\section{What the worm algorithm measures}
+\label{sec:estimators}
+
+DSQSS produces three distinct pieces of output that feed the correlation tensor.
+
+\subsection{Transverse channel: the worm histogram}
+
+In a worm algorithm the off-diagonal correlator is obtained from the statistics
+of the worm itself. Creating a head--tail pair inserts a pair of off-diagonal
+operators into the path integral, so the ratio of the number of configurations
+with heads separated by $(\mathbf{r},\tau)$ to the number with no heads is
+proportional to the correlator. Concretely, DSQSS accumulates
+\begin{equation}
+  G(\mathbf{r},\tau) \;=\; \frac{1}{N\beta\eta^2}
+     \bigl\langle n_{\text{worm}}(\mathbf{r},\tau) \bigr\rangle ,
+\end{equation}
+where $n_{\text{worm}}$ counts how often the head--tail displacement equals
+$(\mathbf{r},\tau)$ during a Monte Carlo cycle and $\eta$ is the worm source
+fugacity. This lands in \code{cf.dat} as entries named
+\code{C<kind>t<itau>}.
+
+Defining
+\begin{equation}
+  \Gpm(\mathbf{r},\tau) = \bigl\langle \Sp_{\mathbf r}(\tau)\,\Sm_0(0)\bigr\rangle,
+  \qquad
+  \Gmp(\mathbf{r},\tau) = \bigl\langle \Sm_{\mathbf r}(\tau)\,\Sp_0(0)\bigr\rangle,
+\end{equation}
+and using $S^x=\tfrac12(\Sp+\Sm)$, $S^y=\tfrac1{2i}(\Sp-\Sm)$ together with the
+U(1) selection rule $\langle \Sp\Sp\rangle=\langle \Sm\Sm\rangle=0$, one gets
+\begin{align}
+  C^{xx}(\mathbf{r},\tau) &= \tfrac14\bigl[\Gpm + \Gmp\bigr],
+  \label{eq:cxx}\\[0.3em]
+  C^{xy}(\mathbf{r},\tau) &= \frac{1}{4i}\bigl[-\Gpm + \Gmp\bigr]
+                           = \frac{i}{4}\bigl[\Gpm - \Gmp\bigr].
+  \label{eq:cxy}
+\end{align}
+Equation~\eqref{eq:cxy} confirms that $C^{xy}$ is purely imaginary, and shows
+that it is carried entirely by the \emph{antisymmetric} combination
+$\Gpm-\Gmp$. The two orderings are related by the KMS condition
+\begin{equation}
+  \Gmp(\mathbf{r},\tau) = \Gpm(\mathbf{r},\beta-\tau),
+  \label{eq:kms}
+\end{equation}
+which is what makes $C^{xx}$ even and $C^{xy}$ odd about $\beta/2$.
+
+\subsection{Longitudinal channel: the structure factor}
+
+DSQSS has no real-space $S^zS^z$ correlator. It measures the $k$-resolved
+dynamic structure factor $S^{zz}(\mathbf{k},\tau)$ by Fourier-transforming the
+instantaneous magnetization on each time slice and correlating slices. Real
+space is recovered in the converter by an inverse transform,
+\begin{equation}
+  C^{zz}(\mathbf{r},\tau)
+  = \frac{1}{N}\sum_{\mathbf{k}\in\text{BZ}}
+      S^{zz}(\mathbf{k},\tau)\, e^{i\mathbf{k}\cdot\mathbf{r}} .
+  \label{eq:zzft}
+\end{equation}
+DSQSS's own generator emits only the product set
+$k_d\in\{0,\dots,L_d/2\}$, relying on
+$S^{zz}(\mathbf{k})=S^{zz}(-\mathbf{k})$ to supply the rest. As
+Section~\ref{sec:corr4} explains, that reasoning fails beyond one dimension, so
+the code here measures the \emph{full} zone instead. Every $\mathbf{k}$ then
+enters \eqref{eq:zzft} with weight one and no multiplicity bookkeeping is
+required. Since distinct $\mathbf{k}$ are independent accumulators, statistical
+errors propagate through \eqref{eq:zzft} in quadrature with the same weights
+squared.
+
+\subsection{Site averaging}
+\label{sec:siteavg}
+
+The worm estimator is intrinsically a \emph{displacement} histogram: it records
+the head--tail separation, not which absolute pair of sites contributed. The
+file \code{disp.xml} assigns each ordered site pair $(i,j)$ to a displacement
+bin, and DSQSS normalizes each bin by the number of pairs it contains, so the
+measured quantity is automatically averaged over all reference sites sharing a
+displacement vector.
+
+On a translation-invariant lattice this is \emph{exact}: $C_{i0}(\tau)$ depends
+only on $\mathbf{r}_i-\mathbf{r}_0$, so the average equals every individual term.
+It is also advantageous, since pooling $N$ reference sites reduces the variance
+per bin by roughly a factor $N$. This is why the project deliberately restricts
+itself to periodic lattices: the site averaging is free accuracy there, whereas
+on a disordered or open-boundary system it would mix inequivalent pairs and a
+per-pair estimator (with correspondingly larger error bars) would be needed.
+
+%======================================================================
+\section{Software architecture}
+
+\subsection{Layout}
+
+\begin{lstlisting}
+quantum_monte_carlo/
+|-- external_dsqss/         vendored DSQSS 2.0.6 (GPLv3), patched
+|-- dsqss_install/          build output (dla, dla_pre, ...)
+|-- patches/
+|   `-- cf_antisymmetric.patch    adds the C^xy channel to the engine
+|-- qmc/
+|   |-- lattice.py          lattice definitions; DSQSS input + coupling file
+|   |-- parse.py            readers for cf.dat / sf output / disp.xml
+|   |-- correlations.py     estimator algebra -> correlation tensor
+|   |-- storage.py          HDF5 writer in the Chebyshev schema
+|   `-- run.py              orchestration
+|-- run_qmc.py              command-line entry point
+|-- validate_ed.py          exact-diagonalization validation
+`-- docs/
+    |-- estimators.md       concise note on the corrections
+    `-- qmc_implementation.tex   this document
+\end{lstlisting}
+
+\subsection{Single source of truth for the lattice}
+
+A subtle integration hazard is that the Chebyshev code stores lattices as raw
+$J_{ij}$ matrices with an arbitrary site ordering (some, such as the tilted
+18-site ``diamond'', have hand-listed periodic pairs and carry no geometric
+information at all). Reconstructing the Bravais structure from such a matrix in
+order to line up site indices with the QMC run is a graph-isomorphism problem in
+general.
+
+This is avoided entirely by inverting the direction of information flow. The
+class \code{PeriodicLattice} is the single source of truth: from one object it
+emits \emph{both} the DSQSS input \emph{and} --- via
+\code{--write-couplings} --- the $J_{ij}$ matrix in the Chebyshev
+\code{Couplings/} format. Both codes then run the identical model with identical
+site indexing by construction, and results can be compared site by site with no
+matching step.
+
+\subsection{Site indexing}
+\label{sec:siteindex}
+
+Sites are labelled by a flat index in $[0,N)$ obtained by row-major (x-fastest)
+unpacking of the coordinates,
+\begin{equation}
+  i = x + L_x y + L_x L_y z ,
+\end{equation}
+matching DSQSS's own \code{index2coord}. Because the same
+\code{PeriodicLattice} object emits the Chebyshev coupling file, this indexing
+is shared by both codes by construction. All correlations are taken with respect
+to site $0$, which sits at the coordinate origin.
+
+Correlations depend only on the displacement from site $0$, so distinct physics
+is obtained by choosing one site per distance class. Sites within a class are
+related by the lattice point group: they are physically identical but fall in
+\emph{different} displacement bins and are measured independently, so requesting
+several of them provides a free consistency check and improves statistics when
+averaged. On \code{square:4x4} at $\beta=2$ the four nearest-neighbour sites
+$1,3,4,12$ returned $-0.10810$, $-0.10821$, $-0.10819$ and $-0.10828$ with error
+bars of $\sim 8\times10^{-5}$.
+
+\subsection{Bond multiplicity}
+
+One detail of \code{coupling\_matrix} deserves comment because it caused a real
+discrepancy. Contributions are \emph{accumulated} rather than assigned:
+along a periodic direction of length $2$ the $+1$ and $-1$ neighbours are the
+same site, and DSQSS's lattice generator lays down two bonds there, giving an
+effective $2J$. Accumulation reproduces this multiplicity automatically in all
+cases, so the exported coupling file always describes exactly the model the QMC
+simulated. This matters only for small test lattices; production sizes have all
+side lengths at least $4$.
+
+%======================================================================
+\section{Four corrections to the estimators}
+\label{sec:corrections}
+
+The naive reading of the DSQSS output is wrong in three separate ways. All three
+were found by comparing against exact diagonalization or against exact symmetry
+requirements, and all three are re-checked automatically by
+\code{validate\_ed.py}. They are documented here in detail because they are not
+apparent from the DSQSS documentation.
+
+\subsection{Correction 1: the stock transverse estimator is symmetrized}
+\label{sec:corr1}
+
+\paragraph{The problem.} DSQSS accumulates the head--tail displacement without
+recording whether the worm head represents $\Sp$ or $\Sm$. Both orderings fall
+into the same histogram bin, so the measured quantity is
+\begin{equation}
+  \code{cf}(\mathbf{r},\tau)
+  = \tfrac12\bigl[\Gpm(\mathbf{r},\tau) + \Gmp(\mathbf{r},\tau)\bigr]
+  = 2\,C^{xx}(\mathbf{r},\tau),
+  \label{eq:cfmeaning}
+\end{equation}
+using \eqref{eq:cxx}. In other words the stock estimator returns exactly the
+symmetric combination --- excellent for $C^{xx}$, but it means the antisymmetric
+combination carrying $C^{xy}$ is \emph{not present in the output at all}.
+
+\paragraph{The evidence.} This is invisible at $h_z=0$, where the two orderings
+coincide, so it must be tested at finite field. On a 4-site chain at
+$\beta=2$, $h_z=1.5$, the run reports magnetization
+$\langle m_z\rangle = 0.2404$ and $\code{cf}(0,0)=0.49954$. For $S=1/2$,
+\begin{equation}
+  \Gpm(0,0)=\langle \Sp\Sm\rangle = \tfrac12+\langle m_z\rangle = 0.740,
+  \qquad
+  \Gmp(0,0)=\tfrac12-\langle m_z\rangle = 0.260 ,
+\end{equation}
+whose mean is $0.500$. The measured value is the mean, to four digits, and is
+independent of the field --- conclusive proof of symmetrization. Consistently,
+the full $\tau$ profile of \code{cf} was found to be symmetric about $\beta/2$
+even at $h_z=1.5$, where the individual orderings are not.
+
+\paragraph{The consequence.} $C^{xx}$ is available from the stock build as
+$\code{cf}/2$. $C^{xy}$ requires the patch of Section~\ref{sec:patch}. This is
+not a negligible omission: at $h_z=1$ on an 8-site chain, exact diagonalization
+gives $\max_\tau|\mathrm{Im}\,C^{xy}|=0.077$ on the local component, against
+correlations of order $0.25$, while the $xx$--$zz$ splitting itself reaches
+$0.052$ on the nearest neighbour.
+
+\subsection{Correction 2: the Marshall gauge staggers the transverse correlator}
+
+\paragraph{The problem.} What makes a bipartite antiferromagnet sign-free is a
+sublattice rotation (Marshall's sign rule). DSQSS implements this by taking
+absolute values of the vertex weights, and indeed reports
+$\code{sign}=1.0$ exactly. The worm therefore samples the
+\emph{rotated-frame} configuration space, and the transverse correlator it
+measures is related to the physical one by a staggered sign,
+\begin{equation}
+  C^{xx}_{\text{phys}}(\mathbf{r},\tau)
+  = (-1)^{\sum_d r_d}\; C^{xx}_{\text{measured}}(\mathbf{r},\tau),
+\end{equation}
+and likewise for $C^{xy}$. The diagonal $C^{zz}$ is invariant under a rotation
+about $z$ and needs no correction.
+
+\paragraph{The evidence.} At $h_z=0$ the isotropic model requires
+$C^{xx}=C^{zz}$ identically. Before the correction, on an 8-site chain at
+$\beta=1$, sites $0$ and $2$ satisfied this to three digits while site $1$ ---
+the nearest neighbour, on the opposite sublattice --- gave $xx=+0.0678$ against
+$zz=-0.0679$: matching magnitude, opposite sign. The pattern followed
+$(-1)^{r}$ exactly. Since $C^{zz}$ for an antiferromagnet must be negative on
+the nearest neighbour, $C^{zz}$ was the correct one.
+
+\paragraph{The fix.} \code{PeriodicLattice.marshall\_sign}, applied to the
+transverse components only, and only for $J>0$.
+
+\subsection{Correction 3: the antisymmetric channel is time-reversed}
+
+\paragraph{The problem.} The worm bins the head--tail time displacement with the
+opposite orientation to the convention adopted here: the measured entry at index
+\code{it} corresponds to $\tau = \beta - \code{it}\cdot\Delta\tau$. Because the
+symmetric channel is even about $\beta/2$, this reversal is a no-op there and
+cannot be detected from $C^{xx}$ or $C^{zz}$. On the antisymmetric channel it is
+a sign flip.
+
+\paragraph{The evidence.} Comparing the patched antisymmetric output against
+exact diagonalization on an 8-site chain at $\beta=2$, $h_z=1$
+(\code{ntau}$=16$):
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+\code{it} & $A[\code{it}]/2$ & exact $\mathrm{Im}\,C^{xy}$ & $A[(n-\code{it})\bmod n]/2$ \\
+\midrule
+ 0 & $-0.07683$ & $-0.07683$ & $-0.07683$ \\
+ 1 & $+0.05790$ & $-0.05791$ & $-0.05788$ \\
+ 2 & $+0.04351$ & $-0.04345$ & $-0.04339$ \\
+ 3 & $+0.03231$ & $-0.03225$ & $-0.03216$ \\
+ 8 & $+0.00013$ & $+0.00000$ & $+0.00013$ \\
+15 & $-0.05788$ & $+0.05791$ & $+0.05790$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The direct reading agrees only at $\tau=0$ (the fixed point of the reversal),
+while the reversed index reproduces the exact result at \emph{every} $\tau$.
+
+\paragraph{The fix.} \code{correlations.\_reverse\_tau}, mapping
+$\code{it}\mapsto(n_\tau-\code{it})\bmod n_\tau$.
+
+\subsection{Correction 4: the half Brillouin zone is not a fundamental domain}
+\label{sec:corr4}
+
+\paragraph{The problem.} The product set $k_d\in\{0,\dots,L_d/2\}$ is a valid
+fundamental domain for $\mathbf{k}\to-\mathbf{k}$ in one dimension, but not in
+two or more. On a $4\times4$ lattice the orbit $\{(1,3),(3,1)\}$ lies entirely
+outside it: neither member has both components in $\{0,1,2\}$. Those two
+wavevectors are therefore never measured, and the back-transform
+\eqref{eq:zzft} silently omits their contribution to $C^{zz}$. On $3\times3$ the
+missing orbit is $\{(1,2),(2,1)\}$; in general the shortfall grows with the
+number of dimensions of length $\geq3$.
+
+\paragraph{The evidence.} At $h_z=0$ isotropy requires $C^{xx}=C^{zz}$. On
+\code{square:4x4} at $\beta=2$ the two differed by $0.021$ against error bars of
+$10^{-4}$ --- a $261\sigma$ discrepancy, plainly visible in the third digit.
+Measuring the full zone brings the same comparison to $10^{-4}$, or
+$1.5\sigma$.
+
+\paragraph{The fix.} \code{parse.write\_full\_bz\_wavevectors} overwrites the
+\code{wv.xml} produced by \code{dla\_pre} with one covering every
+$\mathbf{k}$ in the zone, before \code{dla} runs. The inverse transform is then
+exact with uniform weight, and the multiplicity logic disappears. A partially
+populated structure factor is now a hard error rather than silently propagating
+NaN.
+
+\paragraph{Why it survived the first round of validation.} This is worth
+recording as a methodological point. The original two- and three-dimensional
+test cases were \code{square:4x2} and \code{cube:2x2x2}. In both, every
+potentially problematic direction has length $2$, where $\mathbf{k}\to-\mathbf{k}$
+is trivial and the product set happens to cover the whole zone. The validation
+suite was therefore degenerate in precisely the way that conceals this bug, and
+it passed while the code was wrong. Exercising the $C^{zz}$ path meaningfully
+requires \emph{two or more sides of length} $\geq3$; since an odd side frustrates
+the antiferromagnet, the cheap vehicle is the ferromagnet, which is sign-free on
+any lattice. \code{square:3x3} with $J=-1$ is nine sites, validates in about
+twenty seconds, and is now the standard two-dimensional regression case.
+
+\subsection{Summary of the conversion}
+
+Collecting everything, with $s_{\mathbf r}=(-1)^{\sum_d r_d}$ for $J>0$ and
+$s_{\mathbf r}=1$ otherwise, and $\mathcal{R}$ the $\tau$-reversal:
+\begin{align}
+  C^{xx}(\mathbf{r},\tau) &= \tfrac12\, s_{\mathbf r}\, \code{cf}(\mathbf{r},\tau), \\
+  \mathrm{Im}\,C^{xy}(\mathbf{r},\tau) &= \tfrac12\, s_{\mathbf r}\,
+      \bigl[\mathcal{R}\,\code{af}\bigr](\mathbf{r},\tau),
+      \qquad C^{yx}=-C^{xy}, \\
+  C^{zz}(\mathbf{r},\tau) &= \frac1N\sum_{\mathbf k}
+      S^{zz}(\mathbf{k},\tau)\cos(\mathbf{k}\!\cdot\!\mathbf{r}),
+\end{align}
+the last sum running over the full Brillouin zone with uniform weight.
+
+%======================================================================
+\section{The engine patch}
+\label{sec:patch}
+
+\subsection{What it adds}
+
+\code{patches/cf\_antisymmetric.patch} (about 50 lines against DSQSS 2.0.6) adds
+a second, \emph{signed} histogram to the \code{CF} class. Where the existing
+accumulator increments by $+1$ per event, the new one increments by the worm-head
+type $\pm1$, so it accumulates
+\begin{equation}
+  \code{af}(\mathbf{r},\tau) = \tfrac12\bigl[\Gpm - \Gmp\bigr],
+\end{equation}
+alongside the existing $\tfrac12[\Gpm+\Gmp]$. Results are reported as
+\code{A<kind>t<itau>} in the same file and with the same normalization, and the
+new accumulators are threaded through the existing reset, averaging, MPI
+all-reduce, and checkpoint save/load paths.
+
+The change is backward compatible: an unpatched build simply produces no
+\code{A} entries, the converter detects their absence, and $C^{xy}$ is left
+zero rather than being silently wrong.
+
+\subsection{Identifying the worm-head type --- and a wrong first attempt}
+
+The whole patch hinges on knowing, at measurement time, whether the head
+represents $\Sp$ or $\Sm$. This is worth recording carefully because the
+first attempt was wrong in an instructive way.
+
+\paragraph{Failed attempt.} The measurement is invoked from two places, in
+\code{UP\_ONESTEP} and \code{DOWN\_ONESTEP}, which suggested tagging them $+1$
+and $-1$ respectively. The resulting channel measured
+$6\times10^{-5}$ --- pure noise --- where exact diagonalization requires
+$-0.077$. The reason is that \code{MoveHead} alternates between the two
+routines within the life of a \emph{single} worm: a worm moves both up and down
+before annihilating, so a tag based on the instantaneous direction of travel
+averages to zero. Direction of motion is not the operator type.
+
+\paragraph{Correct identification.} For $S=1/2$ the head type is a property of
+the local worldline configuration: the head is the operator that takes the spin
+state below it to the state above it, so it raises if the state increases across
+the head and lowers otherwise. In DSQSS terms, \code{Worm::x\_behind} holds the
+state left behind by the head and the current segment holds the state ahead, so
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Moving up   & $\code{headtype} = \code{c\_S.X()} - \code{xinc}$ \\
+Moving down & $\code{headtype} = \code{xinc} - \code{c\_S.X()}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+both being $x_{\text{above}}-x_{\text{below}}=\pm1$. The value is captured at
+the \emph{start} of each step, before the move updates the worm state.
+
+With this identification the measured magnitudes matched exact diagonalization
+immediately to four digits; only the $\tau$-orientation of
+Correction~3 remained.
+
+%======================================================================
+\section{Output format}
+\label{sec:output}
+
+The writer in \code{qmc/storage.py} mirrors
+\code{Algorithm/Storage\_Concept/Storage\_Concept.cpp} so that existing
+\code{Plot\_*.py} scripts read QMC files unchanged:
+
+\begin{lstlisting}
+/parameters                     (values stored as HDF5 *attributes*)
+/results/Re_correlation/<i>-0   dataset, shape (nrows, num_TimePoints)
+/results/Im_correlation/<i>-0
+/results/Re_stds/<i>-0
+/results/Im_stds/<i>-0
+/runtime_data                   (timing scalars as attributes)
+\end{lstlisting}
+
+Each dataset carries the same \code{info} attribute string as the C++ writer,
+and the filename is generated by the same rule,
+\begin{center}
+\code{ISO\_\_<lattice>\_\_[sites=i-j-k]\_\_beta=<b>[\_\_J=<J>][\_\_h\_z=<h>].hdf5}
+\end{center}
+Optional fragments appear only when they differ from their defaults. The
+\code{J} fragment is an addition to the C++ scheme: there the couplings live in
+a named source file, whereas here $J$ is a run parameter, and without it a
+ferromagnetic run would silently overwrite an antiferromagnetic one at the same
+$\beta$.
+
+Files are written to \code{<data-dir>/<project>/}, with \code{--data-dir}
+defaulting to \code{Data} relative to the working directory. Existing files are
+not clobbered: following the C++ writer, an \code{X} is appended to the stem
+until a free name is found, giving up to five variants (the base name plus four
+\code{X}s). Once all five exist the last is overwritten, so a repeated scan
+cannot fill the disk indefinitely; the C++ writer raises an error at that point
+instead. The chosen name is reported at the start of the run. Systematic scans
+should vary \code{--project} or \code{--extension} rather than lean on the
+\code{X} chain.
+
+Every run writes four rows in the fixed order $[xx,xy,yx,zz]$, at any field. The
+transverse and longitudinal channels are measured on every run, so collapsing to
+a single row at $h_z=0$ would discard the independent $C^{zz}$ estimate --- the
+cheapest available check on $C^{xx}$, since isotropy requires the two to agree.
+At zero field the $xy$ row is statistically zero. Because a Chebyshev ISO run at
+zero field stores a single row, code reading both sources should branch on
+\code{correlation\_rows} rather than assume a row count.
+
+The layout is stated directly by \code{correlation\_rows} rather than encoded in
+a symmetry-class label, which would be a second, redundant description of the
+same fact and could drift out of step with the data. Three further attributes
+are written beyond the C++ set: \code{method} records the engine, and \code{J}
+and \code{lattice\_size} record the model, which in the C++ scheme is implicit
+in the named couplings file. The Chebyshev-specific spectral bounds
+\code{E\_max} and \code{E\_min} are omitted entirely, having no QMC analogue.
+Error bars come from DSQSS's binning analysis over Monte Carlo sets and are
+written into the \code{\_stds} groups, matching the role of the typicality
+sampling errors in the Chebyshev output.
+
+%======================================================================
+\section{Validation}
+
+\subsection{Method}
+
+\code{validate\_ed.py} constructs the Hamiltonian \eqref{eq:H_cet} independently
+from the same $J_{ij}$ matrix, diagonalizes it densely, and evaluates
+\begin{equation}
+  C^{ab}(\tau) = \frac1Z \sum_{n,m} e^{-\beta E_n}\,
+     e^{\tau(E_n-E_m)}\, A_{nm} B_{mn},
+  \qquad Z=\sum_n e^{-\beta E_n},
+\end{equation}
+in the energy eigenbasis, then compares every component of the QMC output
+against it. Because the $\tau=0$ point has a vanishing statistical error --- it
+is fixed by an operator identity --- a pure ``deviation in units of $\sigma$''
+test is meaningless there, so agreement is accepted if the deviation is within
+tolerance in units of $\sigma$ \emph{or} below a small absolute threshold.
+
+\subsection{Results}
+
+Representative run: 8-site chain, $\beta=2$, $h_z=1$, $n_\tau=16$,
+$2\times10^5$ sweeps per set.
+
+\begin{center}
+\begin{tabular}{ccrr}
+\toprule
+Site & Component & $\max|\Delta|$ & $\max|\Delta|/\sigma$ \\
+\midrule
+0 & $xx$ & $1.39\times10^{-4}$ & 3.92 \\
+0 & $zz$ & $9.73\times10^{-5}$ & 1.50 \\
+0 & $xy$ & $1.53\times10^{-4}$ & 3.67 \\
+1 & $xx$ & $8.65\times10^{-5}$ & 2.34 \\
+1 & $zz$ & $9.25\times10^{-5}$ & 1.80 \\
+1 & $xy$ & $1.62\times10^{-4}$ & 4.77 \\
+2 & $xx$ & $5.78\times10^{-5}$ & 1.93 \\
+2 & $zz$ & $7.07\times10^{-5}$ & 1.46 \\
+2 & $xy$ & $6.88\times10^{-5}$ & 2.21 \\
+3 & $xx$ & $3.29\times10^{-5}$ & 2.14 \\
+3 & $zz$ & $9.95\times10^{-5}$ & 1.94 \\
+3 & $xy$ & $2.41\times10^{-5}$ & 1.18 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Across the parameter matrix:
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+Lattice & $\beta$ & $h_z$ & $J$ & Outcome \\
+\midrule
+\code{chain:8}     & 2.0 & 0.0 & $+1$ & pass \\
+\code{chain:8}     & 2.0 & 1.0 & $+1$ & pass \\
+\code{chain:10}    & 3.0 & 0.0 & $+1$ & pass \\
+\code{chain:6}     & 2.0 & 0.5 & $+1$ & pass \\
+\code{chain:8}     & 2.0 & 0.5 & $-1$ & pass (ferromagnet) \\
+\code{square:3x3}  & 1.5 & 0.4 & $-1$ & pass (2D, non-degenerate BZ) \\
+\code{square:4x3}  & 1.5 & 0.4 & $-1$ & pass (2D, non-degenerate BZ) \\
+\code{square:4x2}  & 1.5 & 0.7 & $+1$ & pass \\
+\code{cube:2x2x2}  & 1.0 & 0.4 & $+1$ & pass (3D) \\
+\code{square:3x2}  & 1.0 & 0.0 & $+1$ & rejected (non-bipartite; sign problem) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Agreement is uniformly at the $10^{-4}$ level, which is the statistical
+resolution of these runs, for all three components, at zero and finite field, in
+one, two and three dimensions, and for both signs of $J$. The ferromagnetic
+cases do double duty: they check that the Marshall correction is correctly
+\emph{skipped} for $J<0$, and --- being sign-free on any lattice --- they make
+odd side lengths available, which is what allows a Brillouin zone that is not
+degenerate under $\mathbf{k}\to-\mathbf{k}$ to be tested at all
+(Section~\ref{sec:corr4}). The non-bipartite antiferromagnet is rejected by
+design.
+
+A further check needs no exact reference and works at any system size: at
+$h_z=0$ isotropy forces $C^{xx}=C^{zz}$. On \code{square:4x4} the two now agree
+to $10^{-4}$, or $1.5\sigma$. It was this test, not the exact-diagonalization
+suite, that exposed the Brillouin-zone bug.
+
+\subsection{Independent consistency checks}
+
+Beyond the exact-diagonalization comparison, the output satisfies several
+constraints that were not imposed by construction:
+$C^{xx}(0)=1/4$ exactly on the local component (an operator identity for
+$S=1/2$); $C^{xx}=C^{zz}$ to within error bars at $h_z=0$; $C^{yx}=-C^{xy}$;
+$C^{zz}(0)<1/4$ at finite field, reduced by the magnetization; and negative
+nearest-neighbour correlations for the antiferromagnet.
+
+\subsection{Performance}
+
+A $4\times4$ periodic square lattice at $\beta=3$, $h_z=0.5$, $n_\tau=64$,
+$10^5$ sweeps per set on 4 MPI ranks completes in under two minutes and yields
+typical error bars of $5\times10^{-5}$. For comparison, this system size is
+modest for the typicality code but the QMC cost grows polynomially, so the
+crossover strongly favours QMC as $N$ increases.
+
+The three-dimensional case makes the point sharply: a $4\times4\times4$ cube
+($N=64$) at $\beta=1$, $n_\tau=16$, $2\times10^4$ sweeps per set runs in about
+$18$ seconds on 4 ranks. The corresponding Hilbert space has $2^{64}$
+dimensions, so this system is permanently out of reach of any state-vector
+method.
+
+For that run the physics is as expected: the local component gives
+$C^{xx}(0)=0.2500$ and $C^{zz}(0)=0.2278$, the $xx$--$zz$ splitting reaches
+$0.038$ on the third measured site, and $\mathrm{Im}\,C^{xy}$ is nonzero on all
+of them.
+
+%======================================================================
+\section{Usage}
+
+\begin{lstlisting}
+./venv/bin/python run_qmc.py \
+    --lattice=square:4x4 --beta=3 --num_TimePoints=64 \
+    --sites=0,1,5 --h_z=0.5 --cores=4
+\end{lstlisting}
+
+The command line deliberately mirrors the Chebyshev executable's options
+(\code{--beta}, \code{--num\_TimePoints}, sites, cores). Adding
+\code{--write-couplings PATH} emits the matching coupling file so the same model
+can be pushed through the Chebyshev code.
+
+A run first prints the parameters it is about to use, then one progress line per
+completed Monte Carlo set with elapsed and remaining time, and finally the path
+written. The progress originates in the sampler and is streamed rather than
+captured, so it appears live even when stdout is a pipe or a batch log;
+\code{std::endl} in DSQSS flushes each line explicitly. No carriage returns or
+redraws are used, keeping HPC job logs readable. The destination is reported only
+at the end, because the name is settled at write time
+(Section~\ref{sec:output}). A warning is emitted if any error bar comes back
+non-finite, which happens when \code{--nset} is small enough that DSQSS's
+$\sqrt{\langle x^2\rangle-\langle x\rangle^2}$ loses its significant digits to
+cancellation; the correlations themselves are unaffected. \code{--quiet} reduces
+the output to the bare path.
+
+The isotropy identity $C^{xx}=C^{zz}$ at $h_z=0$ remains the cheapest
+size-independent check on a production run --- it is what exposed the
+Brillouin-zone bug of Section~\ref{sec:corr4} --- but it is computed on demand
+from the stored file rather than printed by every run.
+
+Validation is run as
+\begin{lstlisting}
+./venv/bin/python validate_ed.py --lattice=chain:8 --beta=2.0 --h_z=1.0 \
+    --nmcs=200000
+\end{lstlisting}
+
+%======================================================================
+\section{Limitations and next steps}
+
+\paragraph{Known limitations.}
+\begin{itemize}
+  \item Sign-problem-free models only: bipartite antiferromagnets ($J>0$, all
+    side lengths even) or any ferromagnet ($J<0$, any lattice). Frustrated,
+    random-sign and antiferromagnetic fully-connected models remain the domain
+    of the typicality code.
+  \item Imaginary time only; no real-time data without analytic continuation.
+  \item Longitudinal field only.
+  \item Uniform $J$ on hypercubic lattices. Site-dependent couplings would run,
+    but the site-averaging of Section~\ref{sec:siteavg} would then mix
+    inequivalent pairs and a per-pair estimator would be required. That patch is
+    localized (the worm knows the absolute head and tail positions) but costs a
+    factor $\sim N$ in statistics for a given pair.
+\end{itemize}
+
+\paragraph{Recommended next step.} The exact-diagonalization validation is
+capped at $N\lesssim14$ by dense diagonalization. The natural next check is a
+direct comparison against existing Chebyshev data on
+\code{Square\_NN\_PBC\_N=16} at an inverse temperature already computed: the two
+error bars should overlap point by point. Because the two methods share no
+machinery, that comparison validates both --- in particular it is an independent
+check on the typicality sampling errors at a size where no exact result exists.
+
+\end{document}

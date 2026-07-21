@@ -1,0 +1,508 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{microtype}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  columns=fullflexible,
+  showstringspaces=false,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\texttt{\textbf{#1}}}
+
+\title{\textbf{Worldline QMC: Code Structure}\\[0.3em]
+       \large What each Python module does and why}
+\author{Implementation notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A file-by-file account of the Python in \code{quantum\_monte\_carlo/}. The
+package \code{qmc/} is a conversion layer wrapped around the DSQSS/DLA worldline
+Monte Carlo engine (vendored in \code{external\_dsqss/}, GPLv3, with one local
+patch); the top-level scripts are the command-line entry point, the correctness
+harness, and the benchmarks against the Chebyshev typicality code. The physics
+and the estimator corrections are documented separately in
+\code{qmc\_implementation.tex}; this document is about the software.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+%======================================================================
+\section{Overview}
+
+\subsection{Layout}
+
+\begin{lstlisting}
+quantum_monte_carlo/
+|-- qmc/                       the package: everything reusable
+|   |-- __init__.py            re-exports the submodules
+|   |-- lattice.py             lattice definition; single source of truth
+|   |-- parse.py               readers/writers for DSQSS's own file formats
+|   |-- correlations.py        estimator algebra: DSQSS output -> physics
+|   |-- storage.py             HDF5 writer in the Chebyshev schema
+|   |-- console.py             terminal styling for the run log
+|   `-- run.py                 orchestration; ties all of the above together
+|-- run_qmc.py                 command-line entry point
+|-- validate_ed.py             correctness harness (exact diagonalization)
+|-- benchmark_vs_chebyshev.py  benchmark at zero field, three sites
+|-- benchmark_field.py         benchmark at finite field, all four components
+`-- plot_benchmark.py          figures for the zero-field benchmark
+\end{lstlisting}
+
+\subsection{Dependency structure}
+
+The package is a shallow stack with no cycles. Only \code{run.py} knows about
+more than one concern:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Module & Imports from the package \\
+\midrule
+\code{lattice.py}     & --- (numpy; \code{h5py} lazily, inside one method) \\
+\code{parse.py}       & --- \\
+\code{correlations.py}& --- \\
+\code{storage.py}     & --- \\
+\code{console.py}     & --- \\
+\code{run.py}         & all five of the above \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The four leaf modules are independently testable and contain no I/O beyond their
+own narrow file formats. That matters because the estimator corrections
+(Section~\ref{sec:correlations}) are the part most likely to need revisiting,
+and they live in a module with no dependencies at all.
+
+\subsection{Where the work actually happens}
+
+A single run passes through the package in this order:
+
+\begin{enumerate}
+  \item \code{lattice.build} turns a spec string such as \code{square:6x4} into a
+    \code{PeriodicLattice}.
+  \item \code{run.run} resolves parameters and calls \code{run.run\_dsqss}.
+  \item \code{lattice.std\_toml} renders the DSQSS input; \code{dla\_pre}
+    expands it into DSQSS's XML files.
+  \item \code{parse.write\_full\_bz\_wavevectors} overwrites one of those files
+    (\code{wv.xml}) to fix a Brillouin-zone coverage bug.
+  \item \code{dla} runs; its progress is streamed through
+    \code{run.\_echo\_progress} and \code{console.Style}.
+  \item \code{parse.read\_results} and \code{parse.read\_displacement\_kinds}
+    read the raw output.
+  \item \code{correlations.*} converts the raw estimators into
+    $C^{xx}$, $C^{xy}$, $C^{zz}$.
+  \item \code{storage.store} writes the HDF5 file in the Chebyshev schema.
+\end{enumerate}
+
+%======================================================================
+\section{The package}
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/\_\_init\_\_.py} --- the package surface}
+
+Five lines. It re-exports the six submodules so that \code{import qmc} followed
+by \code{qmc.lattice.build(...)} works, and declares \code{\_\_all\_\_}. It
+contains no logic deliberately: importing the package should not have side
+effects, and in particular should not require the DSQSS binaries to be present.
+Scripts import what they need directly
+(\code{from qmc import run as run\_mod}), so the re-export is a convenience
+rather than the expected entry route.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/lattice.py} --- geometry and the single source of truth}
+
+\paragraph{Purpose.} Defines the lattice and, critically, defines it \emph{once}
+for both codes.
+
+\paragraph{Why it is written this way.} The Chebyshev code stores lattices as
+raw $J_{ij}$ matrices with an arbitrary site ordering; some were built by hand
+with explicitly listed periodic pairs, and carry no geometric information at
+all. Recovering the Bravais structure from such a matrix in order to line up
+site indices with a QMC run is a graph-isomorphism problem in general. This
+module avoids that entirely by inverting the direction of information flow: one
+\code{PeriodicLattice} object emits \emph{both} the DSQSS input and the
+Chebyshev-format coupling file, so the two codes agree on what ``site 5'' means
+by construction rather than by inspection.
+
+\paragraph{Class \code{PeriodicLattice}.}
+
+\begin{longtable}{@{}p{0.30\textwidth}p{0.64\textwidth}@{}}
+\toprule
+Member & Role \\
+\midrule
+\endhead
+\code{\_\_init\_\_(size, J, name)} &
+  Stores \code{size} (per-dimension lengths), coupling \code{J}, and precomputes
+  \code{coords}, the coordinate of every flat site index. \\
+\code{\_default\_name()} &
+  Produces \code{Chain\_NN\_PBC\_N=8}, \code{Square\_NN\_PBC\_N=24} etc.,
+  matching the Chebyshev naming so output filenames line up. \\
+\code{\_index\_to\_coord(i)} &
+  Row-major, x-fastest unpacking, deliberately identical to DSQSS's
+  \code{index2coord}: $i = x + L_x y + L_x L_y z$. \\
+\code{\_coord\_to\_index(c)} & The inverse. \\
+\code{coupling\_matrix()} &
+  The $J_{ij}$ matrix. Contributions are \emph{accumulated} rather than
+  assigned, which reproduces DSQSS's bond multiplicity: along a periodic
+  direction of length 2 the $+1$ and $-1$ neighbours coincide and DSQSS lays
+  down two bonds, giving an effective $2J$. \\
+\code{displacement\_vector(i,j)} &
+  Minimum-image displacement, using the same wrapping convention as
+  \code{dsqss.displacement}. Used to identify correlation bins. \\
+\code{is\_bipartite} (property) &
+  True when every side length above 2 is even. Gates the antiferromagnet, which
+  otherwise has a sign problem. \\
+\code{marshall\_sign(i,j)} &
+  $(-1)^{\sum_d r_d}$. Undoes the sublattice gauge DSQSS uses to make the
+  antiferromagnet sign-free; applied to transverse components only, and only
+  for $J>0$. \\
+\code{write\_coupling\_file(path)} &
+  Writes \code{all/J\_ij} plus the \code{num\_Spins} attribute --- the
+  Chebyshev \code{Couplings/} format. \code{h5py} is imported inside the method
+  so the module stays importable without it. \\
+\code{std\_toml(...)} &
+  Renders the DSQSS \code{std.toml}. Applies the Hamiltonian mapping
+  $J_z = J_{xy} = -J$, $h = -h_z$. \\
+\bottomrule
+\end{longtable}
+
+\paragraph{Function \code{build(spec, J)}.} Parses \code{chain:L},
+\code{square:LxL}, \code{cube:LxLxL}. A single number expands over all
+dimensions (\code{square:4} $\to$ \code{4x4}); explicit forms may be anisotropic
+(\code{square:8x4}). Raises a clear \code{ValueError} on an unknown kind or a
+dimension-count mismatch, which \code{run\_qmc.py} turns into a one-line CLI
+error.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/parse.py} --- DSQSS's own file formats}
+
+\paragraph{Purpose.} Everything that reads or writes a DSQSS-native file. This
+is the module that absorbs the engine's idiosyncrasies so nothing else has to.
+
+\begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
+\toprule
+Function & Role \\
+\midrule
+\endhead
+\code{read\_results(path)} &
+  Parses \code{R <name> = <mean> <error>} lines, the format DSQSS uses for every
+  observable in every output file. Returns \code{\{name: (mean, error)\}}. \\
+\code{read\_displacement\_kinds(path)} &
+  Reads \code{disp.xml}, mapping each ordered site pair to its displacement bin.
+  Uses a regular expression rather than an XML parser because the file is not
+  well-formed XML --- it has bare comments and repeated top-level tags. \\
+\code{wavevector\_list(size)} &
+  The \emph{full} Brillouin zone as integer $k$ indices. \\
+\code{write\_full\_bz\_wavevectors(...)} &
+  Writes a \code{wv.xml} covering every $k$, replacing the one \code{dla\_pre}
+  generates. \\
+\code{collect\_tau\_series(...)} &
+  Gathers \code{<prefix><kind>t<itau>} entries into \code{(nkinds, ntau)} arrays.
+  Missing entries become NaN rather than zero, so a truncated or partial output
+  file is visible instead of silently producing plausible-looking numbers. \\
+\bottomrule
+\end{longtable}
+
+\paragraph{Why the full Brillouin zone.} DSQSS's own generator emits the product
+set $k_d \in \{0,\dots,L_d/2\}$ and relies on $S(k) = S(-k)$ to cover the rest.
+That is a valid fundamental domain for $k \to -k$ in one dimension but
+\emph{not} in two or more: on a $4\times4$ lattice the orbit
+$\{(1,3),(3,1)\}$ lies entirely outside it, so those $k$ are never measured and
+the back-transform to real space silently loses their contribution. Measuring
+the whole zone makes the transform exact with uniform weight and removes the
+multiplicity bookkeeping. The bug this fixes produced a $261\sigma$ violation of
+an exact symmetry; see \code{qmc\_implementation.tex}.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/correlations.py} --- estimator algebra}
+\label{sec:correlations}
+
+\paragraph{Purpose.} Converts what DSQSS measures into what is physically
+wanted. This is the smallest module and the most subtle; every function here
+exists because the naive reading of the DSQSS output is wrong in some specific
+way.
+
+\begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
+\toprule
+Object & Role \\
+\midrule
+\endhead
+\code{CLASS\_C\_ROWS} &
+  \code{("xx","xy","yx","zz")}. The row order every output file uses, matching
+  symmetry class C of the Chebyshev \code{CorrelationTensor}. \\
+\code{transverse\_from\_cf(...)} &
+  $C^{xx} = \code{cf}/2$. The stock worm estimator does not record whether the
+  head is $S^+$ or $S^-$, so what it reports is the symmetrised combination
+  $\tfrac12[G^{+-}+G^{-+}]$, which is exactly $2C^{xx}$. \\
+\code{\_reverse\_tau(a)} &
+  Maps $i \mapsto (n_\tau - i) \bmod n_\tau$. \\
+\code{xy\_from\_antisymmetric(...)} &
+  $\mathrm{Im}\,C^{xy} = \tfrac12 \mathcal{R}\,\code{af}$, where \code{af} is the
+  signed histogram added by the engine patch. The $\tau$ reversal is required
+  because the worm bins the head--tail time displacement with the opposite
+  orientation; that is invisible in the symmetric channel (even about
+  $\beta/2$) but negates this one. \\
+\code{zz\_from\_structure\_factor(...)} &
+  Inverse Fourier transform of $S^{zz}(k,\tau)$ to real space. Validates that
+  the $k$ grid spans the full zone, checks the input for finiteness, performs
+  the transform under a suppressed-warning block, then checks the output again. \\
+\code{mirror\_to\_full\_beta(...)} &
+  Extends a $[0,\beta)$ series to $\tau=\beta$, with a sign flip for
+  antisymmetric components. \\
+\code{build\_tensor(...)} &
+  Allocates the zero-filled \code{(nsites, nrows, ntau)} arrays. \\
+\bottomrule
+\end{longtable}
+
+\paragraph{The suppressed warnings.} numpy built against Apple's Accelerate BLAS
+leaves floating-point exception flags set inside its vectorised kernels, and
+numpy reports them after the call even when every input and output is finite ---
+confirmed by feeding finite random input, where the warning fires while the
+result still matches \code{einsum} to $7\times10^{-15}$. Because the inputs are
+checked for finiteness immediately before and the outputs immediately after, the
+\code{errstate} block hides a known false alarm rather than a real condition.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/storage.py} --- the output file}
+
+\paragraph{Purpose.} Writes HDF5 in exactly the Chebyshev schema, so existing
+\code{Plot\_*.py} scripts read QMC output unchanged.
+
+\begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
+\toprule
+Function & Role \\
+\midrule
+\endhead
+\code{build\_filename(...)} &
+  Reproduces \code{Storage\_Concept::create\_file}'s naming rule. Optional
+  fragments appear only when they differ from their defaults. \code{J} is an
+  addition to the C++ scheme: there the couplings live in a named source file,
+  whereas here $J$ is a run parameter, and without it a ferromagnetic run would
+  silently overwrite an antiferromagnetic one at the same $\beta$. \\
+\code{\_fmt(x)} &
+  Formats like a C++ \code{ostream}: integers without a trailing \code{.0}, so
+  \code{beta=2} not \code{beta=2.0}. \\
+\code{MAX\_TRIES}, \code{resolve\_path(...)} &
+  Collision avoidance, following the C++ writer: append \code{X} to the stem
+  until a free name is found, up to four. Once all five variants exist the last
+  is overwritten, so a repeated scan cannot fill the disk. (The C++ writer
+  raises at that point instead.) \\
+\code{store(...)} &
+  Writes \code{/parameters} as attributes, the four
+  \code{/results/*/<site>-0} datasets each with the same \code{info} attribute
+  string as the C++ writer, and \code{/runtime\_data}. Validates that the number
+  of sites matches the array shape. \\
+\bottomrule
+\end{longtable}
+
+Every run writes four rows regardless of field. Both the transverse and
+longitudinal channels are measured on every run, so collapsing to a single row
+at $h_z=0$ would discard the independent $C^{zz}$ estimate --- the cheapest
+available check on $C^{xx}$, since isotropy requires the two to agree.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/console.py} --- terminal styling}
+
+\paragraph{Purpose.} ANSI styling for the run log, and nothing else. Isolated in
+its own module so that presentation never entangles with computation.
+
+\code{supports\_colour(stream)} returns true only for a real terminal, and
+respects \code{NO\_COLOR} and \code{TERM=dumb}. \code{Style} exposes semantic
+methods --- \code{head}, \code{value}, \code{ok}, \code{warn}, \code{bad},
+\code{path}, \code{bar} --- which become no-ops when colour is unavailable.
+
+Two design points are deliberate. Style is applied \emph{after} padding, so
+column alignment is byte-identical with and without colour; and there is no
+faint/dim style, because it renders close to unreadable on terminals whose
+palette already has low contrast. Ordinary text keeps the terminal's default
+colour and emphasis is carried by bold and hue alone.
+
+%----------------------------------------------------------------------
+\subsection{\file{qmc/run.py} --- orchestration}
+
+\paragraph{Purpose.} The only module that knows about all the others. It drives
+the external binaries, converts their output, and reports progress.
+
+\subsubsection*{Locating the engine}
+
+\code{INSTALL\_DIR} defaults to \code{dsqss\_install/} beside the package and can
+be overridden with the \code{DSQSS\_INSTALL} environment variable.
+\code{\_binary(name)} raises a message naming the expected path rather than
+letting a bare \code{FileNotFoundError} escape.
+
+\subsubsection*{Running the sampler}
+
+\code{run\_dsqss} writes \code{std.toml}, invokes \code{dla\_pre} to expand it,
+overwrites \code{wv.xml} with the full Brillouin zone, then runs \code{dla}
+(under \code{mpirun} when \code{ncores > 1}).
+
+The subprocess is \emph{streamed} rather than captured, so progress appears
+while the sampler runs instead of arriving in one lump at the end. The full log
+is still retained in memory so that a non-zero exit can be reported with
+context. \code{\_find\_sf\_output} locates the structure-factor file by reading
+the name back out of \code{param.in}, rather than assuming it.
+
+\code{\_SET\_DONE} and \code{\_NCYC} are the regular expressions that recognise
+DSQSS's own progress chatter; \code{\_echo\_progress} reformats a matching line
+into a progress bar and returns whether it recognised it.
+\code{\_format\_seconds} renders durations as \code{45s}, \code{2m31s},
+\code{1h04m}.
+
+\subsubsection*{Converting}
+
+\code{convert} is the heart of the module. It reads the displacement bins and
+both raw estimator files, applies the three corrections, and assembles the
+\code{(nsites, 4, ntau)} tensors. It detects whether the engine is patched by
+checking for the \code{A} entries; an unpatched build leaves $C^{xy}$ at zero
+rather than producing something wrong. A structure factor that is partially
+populated raises immediately, since that would mean the full Brillouin zone was
+not measured.
+
+\subsubsection*{Reporting}
+
+\code{print\_banner} lists the parameters before sampling starts. It
+deliberately does \emph{not} name the destination file, because the name is only
+settled at write time. \code{\_warn\_nonfinite\_errors} flags error bars that
+came back NaN --- DSQSS forms the error as
+$\sqrt{\langle x^2\rangle - \langle x\rangle^2}$, which with few sets on a barely
+fluctuating observable can go slightly negative through cancellation. The
+correlations are unaffected, so this warns rather than aborting.
+\code{\_print\_destination} reports the final path and any \code{X} suffix.
+
+\subsubsection*{The entry point}
+
+\code{run(...)} is the function every script calls. It builds the lattice,
+validates the site list, rejects a frustrated antiferromagnet up front, runs,
+converts, resolves the output path, writes, and cleans up the scratch directory
+unless \code{keep\_workdir} is set.
+
+%======================================================================
+\section{Top-level scripts}
+
+\subsection{\file{run\_qmc.py} --- command-line entry point}
+
+A thin argparse wrapper over \code{run.run}, with options deliberately mirroring
+the Chebyshev executable (\code{--beta}, \code{--num\_TimePoints}, sites,
+cores). It adds \code{--write-couplings} to emit the matching coupling file, and
+\code{--quiet} to reduce output to the bare path so that
+\code{path=\$(run\_qmc.py ... --quiet)} works in scripts.
+
+Configuration errors (\code{ValueError}) are caught and printed as a single line
+with exit code 2; a traceback would add nothing for a mistyped lattice spec or
+an out-of-range site.
+
+\subsection{\file{validate\_ed.py} --- the correctness harness}
+
+Builds the Hamiltonian
+$H = \sum_{i<j} J_{ij}\,\mathbf{S}_i\!\cdot\!\mathbf{S}_j + h_z\sum_i S^z_i$
+independently, diagonalises it densely, and evaluates
+\begin{equation*}
+  C^{ab}(\tau) = \frac{1}{Z}\sum_{n,m} e^{-\beta E_n} e^{\tau(E_n - E_m)}
+                 A_{nm} B_{mn},
+\end{equation*}
+then compares every component of the QMC output against it. This is the
+ground-truth test: it shares no code with the QMC path beyond the lattice
+definition.
+
+Agreement is accepted if the deviation is within tolerance in units of $\sigma$
+\emph{or} below a small absolute threshold, because $\tau=0$ has a vanishing
+statistical error --- it is fixed by an operator identity --- and a pure
+$\sigma$ test is meaningless there.
+
+Two constraints are enforced up front: at most 14 sites (dense diagonalisation),
+and a bipartite lattice unless $J<0$. The help text steers towards
+\code{square:3x3 --J=-1} when the $C^{zz}$ path is being touched, because
+lattices with short sides make $k \to -k$ trivial and hide Brillouin-zone
+coverage bugs --- an earlier suite of \code{square:4x2} and \code{cube:2x2x2}
+passed while $C^{zz}$ was wrong.
+
+\subsection{\file{benchmark\_vs\_chebyshev.py} --- zero-field benchmark}
+
+Compares against real Chebyshev output on the 24-site periodic square, at a size
+where exact diagonalisation is impossible ($2^{24}$ states). The lattice is
+\code{square:6x4}, whose coupling matrix is byte-identical to
+\code{Couplings/Square\_NN\_PBC\_N=24.hdf5}, so sites 0, 1 and 7 are the local,
+nearest-neighbour and next-nearest correlations.
+
+The two codes use different $\tau$ conventions: Chebyshev stores
+\code{linspace(0, beta/2, num\_TimePoints)} --- its \code{Tmax} is $\beta/2$ ---
+while QMC stores a uniform grid on $[0,\beta)$. The comparison is made at the
+QMC grid points inside $[0,\beta/2]$ with the dense reference interpolated onto
+them, so the noisy data is never interpolated. $\tau=0$ is excluded from the
+pull statistic and reported separately as an absolute deviation.
+
+\code{--skip-existing} reuses completed runs, so the comparison can be re-run
+without repeating the sampling.
+
+\subsection{\file{benchmark\_field.py} --- finite-field benchmark}
+
+The same lattice at $h_z \neq 0$. The field data is local only (site 0) but
+carries all four rows, so this exercises what vanishes at zero field:
+$C^{xx}$ and $C^{zz}$ separately, and $\mathrm{Im}\,C^{xy}$ --- which is
+measurable only with the patched estimator and cannot be checked by exact
+diagonalisation at this size.
+
+Three file-format quirks are handled. The field files predate the per-site group
+layout, so \code{results/Re\_correlation} is a flat $(4, n_\tau)$ dataset rather
+than a group. Error datasets are named \code{Re\_stds} in newer files and
+\code{Re\_stddev} in older ones. The $h_z=2$ set carries \emph{no} uncertainties
+at all --- those runs are reported as absolute agreement only, in a separate
+block, rather than inventing a reference error. \code{AVAILABLE} records which
+$(h_z, J)$ combinations exist and at which $\beta$.
+
+\subsection{\file{plot\_benchmark.py} --- figures}
+
+Produces one figure per coupling sign: correlations on top, pull underneath, one
+column per site, all inverse temperatures overlaid. Plotted against $\tau/\beta$
+so every temperature shares the horizontal range $[0,\tfrac12]$, which makes the
+approach to the symmetry point at $\beta/2$ line up across temperatures and lets
+the pull traces be read as flat bands. $\tau=0$ is dropped from the pull panel
+for the same reason it is dropped from the statistic.
+
+%======================================================================
+\section{Conventions that recur}
+
+Several habits appear throughout and are worth stating once.
+
+\paragraph{Missing data becomes NaN, never zero.} \code{collect\_tau\_series}
+fills absent entries with NaN so that a truncated output file is visible.
+Several call sites then check explicitly and raise.
+
+\paragraph{Checks bracket suppressed warnings.} Where a warning is silenced, the
+inputs are validated immediately before and the outputs immediately after, so
+the suppression cannot hide a real condition.
+
+\paragraph{Physics identities are used as tests.} $C^{xx}(0)=\tfrac14$,
+$C^{xx}=C^{zz}$ at $h_z=0$, $C^{yx}=-C^{xy}$, and $C^{xy}(\beta/2)=0$ all hold
+exactly and are checked rather than assumed. The isotropy identity in particular
+is size-independent, and is what exposed the Brillouin-zone bug at a system size
+where no exact reference exists.
+
+\paragraph{Configuration errors are not tracebacks.} Anything the user can
+mistype raises \code{ValueError} with a message naming the fix, which the CLI
+prints as one line with exit code 2.
+
+\paragraph{Presentation is separable.} Every reporting function takes
+\code{out} and \code{style}, and \code{progress} defaults to \code{False} in
+\code{run\_dsqss}, so library use is silent and the harnesses stay readable.
+
+\end{document}
