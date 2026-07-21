@@ -25,7 +25,7 @@ python3 -m venv venv
 
 git clone --depth 1 https://github.com/issp-center-dev/dsqss.git external_dsqss
 cd external_dsqss
-git apply ../patches/cf_antisymmetric.patch     # enables the C^xy channel
+git apply ../patches/dsqss_estimators.patch     # enables the C^xy channel
 cmake -S . -B build \
   -DCMAKE_INSTALL_PREFIX=$PWD/../dsqss_install \
   -DPython3_EXECUTABLE=$PWD/../venv/bin/python \
@@ -296,6 +296,31 @@ sources should branch on `correlation_rows` rather than assume a row count.
 Correlations are site-averaged over all pairs sharing a displacement vector,
 which is exact on a translation-invariant lattice and buys roughly a factor N in
 statistics.
+
+## Performance and system size
+
+The sampling is linear in the number of sites and linear in `beta`. MPI ranks
+run **independent Markov chains**, so more cores buys smaller error bars
+(~1/sqrt(ranks)), not shorter wall time -- measured at 19.2 s on 1 core versus
+21.6 s on 4 for the same job.
+
+Measured, 3D cube at `beta=1`, `ntau=16`, 1 rank: ~3.6 us per site per sweep,
+flat from N = 64 to N = 1728. Extrapolated wall time for 10^6 sweeps:
+
+| L (cube) | N | wall time |
+|---|---|---|
+| 4 | 64 | 4 min |
+| 8 | 512 | 31 min |
+| 16 | 4,096 | 4.1 h |
+| 32 | 32,768 | 33 h |
+| 64 | 262,144 | 11 days |
+
+Multiply by `beta`. Memory is dominated by the per-site imaginary-time
+magnetization, `N * ntau * 8` bytes (134 MB at L = 64, ntau = 64).
+
+Earlier versions were O(N^2) because `C^zz` went through the structure factor
+and `disp.xml` enumerated all site pairs; at L = 16 that cost 7.3 days rather
+than 4.1 hours. See `docs/estimators.md`.
 
 ## Validation
 

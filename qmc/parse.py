@@ -1,11 +1,11 @@
 """Readers for the DSQSS/DLA output files.
 
-Result lines everywhere look like ``R <name> = <mean> <error>``. The transverse
-correlations land in ``cf.dat`` as ``C<kind>t<itau>``, the k-resolved S^zz in
-``sample.log`` as ``S<ik>t<itau>``.
+Result lines everywhere look like ``R <name> = <mean> <error>``. With the patch
+applied, ``cf.dat`` carries all three measured channels on the same displacement
+classes: ``C<kind>t<itau>`` (transverse, symmetric), ``A<kind>t<itau>``
+(transverse, antisymmetric) and ``D<kind>t<itau>`` (real-space S^z S^z).
 """
 
-import itertools
 import re
 
 import numpy as np
@@ -43,46 +43,42 @@ def read_displacement_kinds(path):
     return kinds
 
 
-def wavevector_list(size):
-    """The full Brillouin zone, in integer units of 2*pi/L per dimension.
+def write_site_displacements(path, lat, sites):
+    """Write a ``disp.xml`` covering only the requested displacement classes.
 
-    DSQSS's own generator emits the product set ``{0..L/2}`` per dimension and
-    relies on S(k) = S(-k) to cover the rest. That is a valid fundamental domain
-    for k -> -k in one dimension, but *not* in two or more: on a 4x4 lattice the
-    orbit {(1,3), (3,1)} lies entirely outside it, so those k are never measured
-    and the back-transform to real space silently loses their contribution.
+    DSQSS's own generator enumerates every ordered site pair and bins them into
+    roughly N displacement classes, so both the file and the per-step
+    accumulator loop are O(N^2). Nothing needs that: a run asks for a handful of
+    sites, and every other class is measured and discarded.
 
-    The full zone is measured instead (see ``write_full_bz_wavevectors``), which
-    makes the inverse transform exact with uniform weight and removes the need
-    for any multiplicity bookkeeping.
+    Here class ``k`` is the displacement from site 0 to ``sites[k]``, and the
+    file lists every ordered pair sharing that displacement -- N pairs per
+    class on a translation-invariant lattice, so the site averaging and the
+    ``NR[kind]`` normalization inside DSQSS are unchanged.
     """
-    axes = [list(range(length)) for length in size]
-    return np.array(list(itertools.product(*axes)), dtype=np.int64)
+    # Built by translating each source site by the requested displacement,
+    # rather than scanning all N^2 pairs and testing each: the partner site is
+    # determined by arithmetic, so this is O(N * len(sites)).
+    size = np.asarray(lat.size, dtype=np.int64)
+    strides = np.cumprod(np.concatenate(([1], size[:-1])))
+    entries = []
+    for kind, site in enumerate(sites):
+        shifted = (lat.coords + np.asarray(lat.displacement_vector(0, site))) % size
+        partners = shifted @ strides
+        entries.extend((kind, i, int(j)) for i, j in enumerate(partners))
 
-
-def write_full_bz_wavevectors(path, size, coords, comment="full-BZ"):
-    """Write a DSQSS ``wv.xml`` covering every k in the Brillouin zone.
-
-    The file stores the precomputed phases cos/sin(2*pi*k.r/L) for each
-    (site, k) pair, matching ``dsqss.wavevector.Wavevector.write_xml``. The k
-    ordering is the one ``wavevector_list`` returns.
-    """
-    size = np.asarray(size, dtype=np.int64)
-    kvecs = wavevector_list(size)
     with open(path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write("<WaveVector>\n")
-        f.write(f"<Comment> {comment} </Comment>\n")
-        f.write(f"<NumberOfSites> {len(coords)} </NumberOfSites>\n")
-        f.write(f"<NumberOfWaveVectors> {len(kvecs)} </NumberOfWaveVectors>\n")
-        f.write("<!-- <RK> [phase(cos)] [phase(sin)] [isite] [kindx] </RK> -->\n")
-        for ik, k in enumerate(kvecs):
-            for isite, coord in enumerate(coords):
-                phase = 2.0 * np.pi * float(np.sum(k * coord / size))
-                f.write(f"<RK> {np.cos(phase):0< 18} {np.sin(phase):0< 18} "
-                        f"{isite} {ik} </RK>\n")
-        f.write("</WaveVector>\n")
-    return kvecs
+        f.write("<Displacements>\n")
+        f.write(f"<Comment> {lat.name}, sites "
+                f"{','.join(str(s) for s in sites)} </Comment>\n")
+        f.write(f"<NumberOfKinds> {len(sites)} </NumberOfKinds>\n")
+        f.write(f"<NumberOfSites> {lat.nsites} </NumberOfSites>\n")
+        f.write("\n<!-- <R> [kind] [isite] [jsite] </R> -->\n\n")
+        for kind, i, j in entries:
+            f.write(f"<R> {kind} {i} {j} </R>\n")
+        f.write("</Displacements>\n")
+    return len(entries)
 
 
 def collect_tau_series(results, prefix, nkinds, ntau):

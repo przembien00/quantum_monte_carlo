@@ -122,8 +122,8 @@ def main(argv=None):
     sites = list(range(min(lat.nsites, 4)))
 
     outputs = run_mod.run_dsqss(
-        lat, args.beta, args.ntau, args.workdir, h_z=args.h_z,
-        mc={"nmcs": args.nmcs, "nset": args.nset},
+        lat, args.beta, args.ntau, args.workdir, spin_sites=sites,
+        h_z=args.h_z, mc={"nmcs": args.nmcs, "nset": args.nset},
     )
     params, corr_re, corr_im, stds_re, stds_im = run_mod.convert(
         lat, args.beta, args.ntau, outputs, sites, h_z=args.h_z,

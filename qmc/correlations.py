@@ -14,10 +14,16 @@ S^x S^x + S^y S^y = 1/2 (S^+S^- + S^-S^+),
 
 The antisymmetric combination 1/2[G^{+-} - G^{-+}], which carries C^xy, is not
 separable from the stock estimator; it requires the patch in
-``patches/cf_antisymmetric.patch`` and appears as ``A<kind>t<itau>`` entries.
+``patches/dsqss_estimators.patch`` and appears as ``A<kind>t<itau>`` entries.
 
-``sfoutfile`` holds S^zz(k, tau) on half the Brillouin zone; the real-space
-C^zz(r, tau) is recovered by an inverse Fourier transform using S(k) = S(-k).
+C^zz is measured directly in real space by the same patch, on the same
+displacement classes, and appears as ``D<kind>t<itau>``. It needs no conversion
+at all -- ``convert`` reads it straight through.
+
+Earlier versions obtained C^zz by inverse-Fourier-transforming the structure
+factor over the full Brillouin zone. That was correct but cost O(N^2) per
+measurement and dominated everything past a few hundred sites; the real-space
+estimator is linear in N. See docs/estimators.md.
 """
 
 import numpy as np
@@ -52,57 +58,6 @@ def xy_from_antisymmetric(af_mean, af_err):
     diagonalization in validate_ed.py.
     """
     return 0.5 * _reverse_tau(af_mean), 0.5 * np.abs(_reverse_tau(af_err))
-
-
-def zz_from_structure_factor(sf_mean, sf_err, kvecs, size, coords):
-    """Inverse-Fourier S^zz(k, tau) to C^zz(r_i, tau) for every site.
-
-    ``kvecs`` must span the full Brillouin zone, so every k enters with weight
-    one and no multiplicity bookkeeping is needed. Returns arrays of shape
-    (nsites, ntau).
-    """
-    size = np.asarray(size, dtype=np.int64)
-    nsites = int(np.prod(size))
-    if len(kvecs) != nsites:
-        raise ValueError(
-            f"expected {nsites} wavevectors spanning the full Brillouin zone, "
-            f"got {len(kvecs)}. A partial zone silently drops the k orbits it "
-            "does not cover; see parse.wavevector_list."
-        )
-    ntau = sf_mean.shape[1]
-
-    # Checked here rather than relying on floating-point warnings from the
-    # matmul below, which on some BLAS backends fire spuriously (see errstate).
-    if not np.all(np.isfinite(sf_mean)) or not np.all(np.isfinite(sf_err)):
-        raise ValueError(
-            "structure factor contains non-finite values, so C^zz cannot be "
-            "computed. This usually means dla did not finish writing its "
-            "output, or the run diverged."
-        )
-
-    czz = np.zeros((nsites, ntau))
-    czz_err = np.zeros((nsites, ntau))
-    # numpy built against Apple's Accelerate raises spurious divide/overflow/
-    # invalid warnings from matmul: the library leaves floating-point exception
-    # flags set by its vectorized kernels (padding lanes included) and numpy
-    # reports them afterwards. Verified on finite random input that the warning
-    # fires while the result still agrees with einsum to 7e-15. The inputs are
-    # checked for finiteness above, so nothing real is being masked here.
-    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        for isite in range(nsites):
-            weight = np.cos(
-                2.0 * np.pi * np.sum(kvecs * coords[isite] / size, axis=1)
-            ) / nsites
-            czz[isite] = weight @ sf_mean
-            # Distinct k are independent accumulators, so errors add in quadrature.
-            czz_err[isite] = np.sqrt((weight**2) @ (sf_err**2))
-
-    if not np.all(np.isfinite(czz)) or not np.all(np.isfinite(czz_err)):
-        raise RuntimeError(
-            "the transform to real space produced non-finite C^zz from finite "
-            "input, which should not happen; do not trust this run."
-        )
-    return czz, czz_err
 
 
 def mirror_to_full_beta(values, antisymmetric=False):

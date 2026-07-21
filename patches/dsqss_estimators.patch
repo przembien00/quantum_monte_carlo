@@ -1,0 +1,549 @@
+diff --git a/src/dla/cf.hpp b/src/dla/cf.hpp
+index b6c06c8..56c9f4a 100644
+--- a/src/dla/cf.hpp
++++ b/src/dla/cf.hpp
+@@ -44,15 +44,20 @@ class CF {
+   Accumulator SIGN;
+   std::vector<std::vector<Accumulator> > ACC;
+   std::vector<std::vector<Accumulator> > PHY;
++  // Antisymmetric channel: the same histogram weighted by the worm-head type,
++  // giving (G^{+-} - G^{-+})/2 where ACC gives (G^{+-} + G^{-+})/2.
++  std::vector<std::vector<Accumulator> > ACC_A;
++  std::vector<std::vector<Accumulator> > PHY_A;
+ 
+   std::vector<std::vector<int> > counter;
++  std::vector<std::vector<int> > counterA;
+ 
+  public:
+   CF(Parameter const& param, Lattice& lat, Algorithm& alg, Displacement& disp);
+   void setinit();
+   void reset();
+   void count(double tT, double bT, int head_site, int tail_site,
+-             double tail_tau);
++             double tail_tau, int headtype);
+   void accumulate(int NCYC, double sgn);
+   void setsummary();
+   void summary();
+@@ -83,16 +88,23 @@ CF::CF(Parameter const& param, Lattice& lat, Algorithm& alg, Displacement& disp)
+     for (int i = 0; i < nkinds; i++) {
+       ACC.push_back(std::vector<Accumulator>(Ntau));
+       PHY.push_back(std::vector<Accumulator>(Ntau));
++      ACC_A.push_back(std::vector<Accumulator>(Ntau));
++      PHY_A.push_back(std::vector<Accumulator>(Ntau));
+       for (int it = 0; it < Ntau; it++) {
+         std::stringstream ss;
+         ss << "C" << i << "t" << it;
+         ACC[i][it].reset();
+         PHY[i][it].reset(ss.str());
++        std::stringstream sa;
++        sa << "A" << i << "t" << it;
++        ACC_A[i][it].reset();
++        PHY_A[i][it].reset(sa.str());
+       }
+     }
+ 
+     for (int i = 0; i < nkinds; i++) {
+       counter.push_back(std::vector<int>(Ntau));
++      counterA.push_back(std::vector<int>(Ntau));
+     }
+   }
+ }
+@@ -104,7 +116,10 @@ inline void CF::setinit() {
+   AutoDebugDump("CF::setinit");
+   SIGN.reset();
+   for (int i = 0; i < nkinds; i++)
+-    for (int itau = 0; itau < Ntau; itau++) ACC[i][itau].reset();
++    for (int itau = 0; itau < Ntau; itau++) {
++      ACC[i][itau].reset();
++      ACC_A[i][itau].reset();
++    }
+ }
+ 
+ inline void CF::show(FILE* F) {
+@@ -116,6 +131,9 @@ inline void CF::show(FILE* F) {
+     for (int it = 0; it < Ntau; it++) {
+       PHY[i][it].show(F, "R");
+     }
++    for (int it = 0; it < Ntau; it++) {
++      PHY_A[i][it].show(F, "R");
++    }
+     std::fprintf(F, "\n");
+   }
+ }
+@@ -128,8 +146,10 @@ inline void CF::accumulate(int NCYC, double sgn) {
+   SIGN.accumulate(sgn);
+   const double invNCYC = 1.0 / NCYC;
+   for (int icf = 0; icf < nkinds; icf++)
+-    for (int it = 0; it < Ntau; it++)
++    for (int it = 0; it < Ntau; it++) {
+       ACC[icf][it].accumulate(sgn * invNCYC * counter[icf][it]);
++      ACC_A[icf][it].accumulate(sgn * invNCYC * counterA[icf][it]);
++    }
+ }
+ 
+ inline void CF::summary() {
+@@ -138,11 +158,14 @@ inline void CF::summary() {
+   }
+   AutoDebugDump("CF::summary");
+   for (int i = 0; i < nkinds; i++)
+-    for (int itau = 0; itau < Ntau; itau++) PHY[i][itau].average();
++    for (int itau = 0; itau < Ntau; itau++) {
++      PHY[i][itau].average();
++      PHY_A[i][itau].average();
++    }
+ }
+ 
+ void CF::count(double tT, double bT, int head_site, int tail_site,
+-               double tail_tau) {
++               double tail_tau, int headtype) {
+   if (!to_be_calc) {
+     return;
+   }
+@@ -166,13 +189,16 @@ void CF::count(double tT, double bT, int head_site, int tail_site,
+   if (bTr <= tTr) {
+     for (int ktau = bTri; ktau <= tTri; ktau++) {
+       counter[icf][ktau % Ntau] += 1;
++      counterA[icf][ktau % Ntau] += headtype;
+     }
+   } else {
+     for (int ktau = 0; ktau <= tTri; ktau++) {
+       counter[icf][ktau] += 1;
++      counterA[icf][ktau] += headtype;
+     }
+     for (int ktau = bTri; ktau < Ntau; ktau++) {
+       counter[icf][ktau] += 1;
++      counterA[icf][ktau] += headtype;
+     }
+   }
+ 
+@@ -187,6 +213,7 @@ void CF::reset() {
+   for (int icf = 0; icf < nkinds; icf++) {
+     for (int it = 0; it < Ntau; it++) {
+       counter[icf][it] = 0;
++      counterA[icf][it] = 0;
+     }
+   }
+ }
+@@ -208,6 +235,8 @@ void CF::setsummary() {
+       for (int it = 0; it < Ntau; it++) {
+         ACC[icf][it].average();
+         PHY[icf][it].accumulate(invsign * ACC[icf][it].mean() * factor);
++        ACC_A[icf][it].average();
++        PHY_A[icf][it].accumulate(invsign * ACC_A[icf][it].mean() * factor);
+       }
+     }
+   }
+@@ -218,6 +247,7 @@ void CF::allreduce(MPI_Comm comm) {
+   for (int icf = 0; icf < nkinds; icf++) {
+     for (int it = 0; it < Ntau; it++) {
+       PHY[icf][it].allreduce(comm);
++      PHY_A[icf][it].allreduce(comm);
+     }
+   }
+ }
+@@ -227,6 +257,8 @@ void CF::save(std::ofstream& F) const {
+   Serialize::save(F, SIGN);
+   Serialize::save(F, ACC);
+   Serialize::save(F, PHY);
++  Serialize::save(F, ACC_A);
++  Serialize::save(F, PHY_A);
+ }
+ 
+ void CF::load(std::ifstream& F) {
+@@ -247,6 +279,8 @@ void CF::load(std::ifstream& F) {
+     }
+   }
+   Serialize::load(F, PHY);
++  Serialize::load(F, ACC_A);
++  Serialize::load(F, PHY_A);
+ }
+ 
+ #endif  // SRC_DLA_CF_HPP_
+diff --git a/src/dla/df.hpp b/src/dla/df.hpp
+new file mode 100644
+index 0000000..15d436a
+--- /dev/null
++++ b/src/dla/df.hpp
+@@ -0,0 +1,261 @@
++// DSQSS (Discrete Space Quantum Systems Solver)
++// Copyright (C) 2018- The University of Tokyo
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++// Real-space imaginary-time S^z S^z correlator.
++//
++// The stock way to reach C^zz(r, tau) in DSQSS is to measure the structure
++// factor S^zz(k, tau) and Fourier transform back. That costs O(N_site * N_k)
++// per time slice, and an exact back-transform needs the whole Brillouin zone
++// (N_k = N_site), so the measurement is O(N^2) and dominates every other cost
++// beyond a few hundred sites.
++//
++// This class measures the same quantity directly in real space, on the
++// displacement classes named in the displacement file:
++//
++//   C^zz(r, tau) = (1/N_r) sum_{(i,j) in r} (1/Ntau) sum_t mz_i(t) mz_j(t+tau)
++//
++// which is O(N_r * N_pairs * Ntau^2). With a handful of requested
++// displacements that is linear in the number of sites, and the Brillouin-zone
++// machinery is not needed at all.
++//
++// Results are reported as D<kind>t<itau>, alongside the CF entries.
++
++#ifndef SRC_DLA_DF_HPP_
++#define SRC_DLA_DF_HPP_
++
++#include <cstdio>
++#include <fstream>
++#include <sstream>
++#include <utility>
++#include <vector>
++
++#include "accumulator.hpp"
++#include "algorithm.hpp"
++#include "debug.hpp"
++#include "displacement.hpp"
++#include "lattice.hpp"
++#include "parameter.hpp"
++
++class DF {
++ private:
++  bool to_be_calc;
++  Lattice& LAT;
++  Displacement& DISP;
++  int nkinds;
++  int Ntau;
++  double dtau;
++
++  Accumulator SIGN;
++  std::vector<std::vector<Accumulator> > ACC;
++  std::vector<std::vector<Accumulator> > PHY;
++
++  // mz[site][time slice] for the current configuration.
++  std::vector<std::vector<double> > mz;
++  // pairs[kind] = the (i, j) site pairs belonging to that displacement.
++  std::vector<std::vector<std::pair<int, int> > > pairs;
++
++ public:
++  DF(Parameter const& param, Lattice& lat, Displacement& disp);
++  void setinit();
++  void measure(double sgn);
++  void setsummary();
++  void summary();
++#ifdef MULTI
++  void allreduce(MPI_Comm comm);
++#endif
++  void show(FILE*);
++
++  void save(std::ofstream& F) const;
++  void load(std::ifstream& F);
++
++  bool calculated() { return to_be_calc; }
++};
++
++DF::DF(Parameter const& param, Lattice& lat, Displacement& disp)
++    : to_be_calc(false),
++      LAT(lat),
++      DISP(disp),
++      nkinds(disp.nkinds),
++      Ntau(param.NTAU),
++      dtau(param.BETA / param.NTAU) {
++  AutoDebugDump("DF::DF");
++  if (!disp.defined) {
++    return;
++  }
++  to_be_calc = true;
++
++  SIGN.reset();
++  for (int i = 0; i < nkinds; i++) {
++    ACC.push_back(std::vector<Accumulator>(Ntau));
++    PHY.push_back(std::vector<Accumulator>(Ntau));
++    for (int it = 0; it < Ntau; it++) {
++      std::stringstream ss;
++      ss << "D" << i << "t" << it;
++      ACC[i][it].reset();
++      PHY[i][it].reset(ss.str());
++    }
++  }
++
++  // Invert the (i, j) -> kind map once, so measurement walks pairs directly.
++  pairs.resize(nkinds);
++  for (Displacement::IR_iterator it = DISP.IR.begin(); it != DISP.IR.end();
++       ++it) {
++    pairs[it->second].push_back(it->first);
++  }
++
++  mz.resize(LAT.NSITE, std::vector<double>(Ntau, 0.0));
++}
++
++inline void DF::setinit() {
++  if (!to_be_calc) {
++    return;
++  }
++  AutoDebugDump("DF::setinit");
++  SIGN.reset();
++  for (int i = 0; i < nkinds; i++)
++    for (int itau = 0; itau < Ntau; itau++) ACC[i][itau].reset();
++}
++
++void DF::measure(double sgn) {
++  if (!to_be_calc) {
++    return;
++  }
++  AutoDebugDump("DF::measure");
++
++  // Sample every worldline onto the uniform tau grid. Same discretization the
++  // structure factor uses, so the two agree where both are available.
++  for (int s = 0; s < LAT.NSITE; s++) {
++    Site& SITE = LAT.S(s);
++    SiteProperty& SP = SITE.Property();
++    Site::iterator p(SITE);
++
++    double bTri = 0.0;
++    double tau = 0.0;
++    int it = 0;
++
++    while (!(++p).atOrigin()) {
++      Segment& S = *p;
++      const double m = SP.XVALS[S.X()];
++      const double tTri = bTri + S.length();
++
++      while (it < Ntau && tau < tTri) {
++        mz[s][it] = m;
++        it++;
++        tau = it * dtau;
++      }
++      bTri = tTri;
++    }
++    // A worldline that ends fractionally short of the last grid point.
++    while (it < Ntau) {
++      mz[s][it] = mz[s][it - 1];
++      it++;
++    }
++  }
++
++  const double invNtau = 1.0 / Ntau;
++  SIGN.accumulate(sgn);
++
++  for (int ik = 0; ik < nkinds; ik++) {
++    const std::vector<std::pair<int, int> >& pk = pairs[ik];
++    const int npair = static_cast<int>(pk.size());
++    if (npair == 0) {
++      continue;
++    }
++    const double invpair = 1.0 / npair;
++    for (int it = 0; it < Ntau; it++) {
++      double DZT = 0.0;
++      for (int ip = 0; ip < npair; ip++) {
++        const std::vector<double>& mi = mz[pk[ip].first];
++        const std::vector<double>& mj = mz[pk[ip].second];
++        for (int tt = 0; tt < Ntau; tt++) {
++          DZT += mi[tt] * mj[(tt + it) % Ntau];
++        }
++      }
++      ACC[ik][it].accumulate(sgn * DZT * invNtau * invpair);
++    }
++  }
++}
++
++inline void DF::show(FILE* F) {
++  if (!to_be_calc) {
++    return;
++  }
++  AutoDebugDump("DF::show");
++  for (int i = 0; i < nkinds; i++) {
++    for (int it = 0; it < Ntau; it++) {
++      PHY[i][it].show(F, "R");
++    }
++    std::fprintf(F, "\n");
++  }
++}
++
++inline void DF::summary() {
++  if (!to_be_calc) {
++    return;
++  }
++  AutoDebugDump("DF::summary");
++  for (int i = 0; i < nkinds; i++)
++    for (int itau = 0; itau < Ntau; itau++) PHY[i][itau].average();
++}
++
++void DF::setsummary() {
++  if (!to_be_calc) {
++    return;
++  }
++  AutoDebugDump("DF::setsummary");
++  SIGN.average();
++  const double sgn = SIGN.mean();
++  if (sgn == 0.0) {
++    return;
++  }
++  const double invsign = 1.0 / sgn;
++  for (int ik = 0; ik < nkinds; ik++) {
++    for (int it = 0; it < Ntau; it++) {
++      ACC[ik][it].average();
++      PHY[ik][it].accumulate(invsign * ACC[ik][it].mean());
++    }
++  }
++}
++
++#ifdef MULTI
++void DF::allreduce(MPI_Comm comm) {
++  for (int ik = 0; ik < nkinds; ik++) {
++    for (int it = 0; it < Ntau; it++) {
++      PHY[ik][it].allreduce(comm);
++    }
++  }
++}
++#endif
++
++void DF::save(std::ofstream& F) const {
++  Serialize::save(F, SIGN);
++  Serialize::save(F, ACC);
++  Serialize::save(F, PHY);
++}
++
++void DF::load(std::ifstream& F) {
++  Serialize::load(F, SIGN);
++  Serialize::load(F, ACC);
++  const int NKINDS = ACC.size();
++  if (nkinds != NKINDS) {
++    std::cerr << "ERROR: nkinds is mismatched" << std::endl;
++    std::cerr << "       dispfile maybe changed." << std::endl;
++    exit(1);
++  }
++  Serialize::load(F, PHY);
++}
++
++#endif  // SRC_DLA_DF_HPP_
+diff --git a/src/dla/dla.cc b/src/dla/dla.cc
+index bb0ae22..775f265 100644
+--- a/src/dla/dla.cc
++++ b/src/dla/dla.cc
+@@ -93,6 +93,7 @@ Simulation::Simulation(Parameter& P0)
+       DISP(P),
+       MSR(P, LAT, ALG, WV),
+       sf(P, LAT, ALG, WV),
++      df(P, LAT, DISP),
+       cf(P, LAT, ALG, DISP),
+       ck(P, LAT, ALG, WV) {
+   AutoDebugDump("Simulation::Simulation");
+@@ -146,12 +147,14 @@ Simulation::Simulation(Parameter& P0)
+   MSR.allreduce(MPI_COMM_WORLD);
+   calctimer.allreduce(MPI_COMM_WORLD);
+   sf.allreduce(MPI_COMM_WORLD);
++  df.allreduce(MPI_COMM_WORLD);
+   cf.allreduce(MPI_COMM_WORLD);
+   ck.allreduce(MPI_COMM_WORLD);
+ #endif
+   MSR.summary();
+   calctimer.summary();
+   sf.summary();
++  df.summary();
+   cf.summary();
+   ck.summary();
+ 
+@@ -181,6 +184,7 @@ Simulation::Simulation(Parameter& P0)
+       LAT.show_param(P.FOUT4CF);
+       P.dump(P.FOUT4CF);
+       cf.show(P.FOUT4CF);
++      df.show(P.FOUT4CF);
+     }
+ 
+     if (P.FOUT4SF) {
+@@ -271,6 +275,7 @@ void Simulation::Set(int ntherm, int nmcs) {
+     MSR.setinit();
+     calctimer.setinit();
+     sf.setinit();
++    df.setinit();
+     cf.setinit();
+     ck.setinit();
+   } else {
+@@ -293,6 +298,7 @@ void Simulation::Set(int ntherm, int nmcs) {
+     MSR.measure(sgn);
+     MSR.accumulate_length(AMP, sgn);
+     sf.measure(sgn);
++    df.measure(sgn);
+     cf.accumulate(P.NCYC, sgn);
+     ck.accumulate(P.NCYC, sgn);
+   }
+@@ -301,6 +307,7 @@ void Simulation::Set(int ntherm, int nmcs) {
+   MSR.setsummary();
+   calctimer.setsummary();
+   sf.setsummary();
++  df.setsummary();
+   cf.setsummary();
+   ck.setsummary();
+ }
+@@ -432,6 +439,12 @@ double Simulation::UP_ONESTEP(bool thermalized) {
+ 
+   const int xinc = W.getXBEHIND();
+ 
++  // Worm-head operator type for this step: does the head raise (+1) or lower
++  // (-1) the spin across itself. Moving up, the traversed region below carries
++  // xinc and the segment ahead carries c_S.X(). Captured before the move,
++  // since both change as the head advances.
++  const int c_headtype = c_S.X() - xinc;
++
+   // Using a std::vector is slightly slower (1~5%) than using a raw pointer
+   // for some environment... X(
+   UniformInterval* UI = new UniformInterval[NCI];
+@@ -621,7 +634,7 @@ double Simulation::UP_ONESTEP(bool thermalized) {
+ 
+   if (thermalized) {
+     const int head_site = c_Site.id() - 1;
+-    cf.count(c_time + len, c_time, head_site, tail_site, tail_tau);
++    cf.count(c_time + len, c_time, head_site, tail_site, tail_tau, c_headtype);
+     ck.count((head_site - tail_site + LAT.NSITE) % LAT.NSITE, c_time + len,
+              c_time, tail_tau);
+   }
+@@ -648,6 +661,10 @@ double Simulation::DOWN_ONESTEP(bool thermalized) {
+ 
+   const int xinc = W.getXBEHIND();
+ 
++  // As in UP_ONESTEP, but the head came from above: the region above carries
++  // xinc and the segment ahead (below) carries c_S.X().
++  const int c_headtype = xinc - c_S.X();
++
+   // Using a std::vector is slightly slower (1~5%) than using a raw pointer
+   // for some environment... X(
+   UniformInterval* UI = new UniformInterval[NCI];
+@@ -835,7 +852,7 @@ double Simulation::DOWN_ONESTEP(bool thermalized) {
+ 
+   if (thermalized) {
+     const int head_site = c_Site.id() - 1;
+-    cf.count(c_time, c_time - len, head_site, tail_site, tail_tau);
++    cf.count(c_time, c_time - len, head_site, tail_site, tail_tau, c_headtype);
+     ck.count((head_site - tail_site + LAT.NSITE) % LAT.NSITE, c_time,
+              c_time - len, tail_tau);
+   }
+diff --git a/src/dla/dla.hpp b/src/dla/dla.hpp
+index 9daddcb..5ac71f5 100644
+--- a/src/dla/dla.hpp
++++ b/src/dla/dla.hpp
+@@ -80,6 +80,7 @@ bool ALERT = false;
+ #include "name.h"
+ #include "objects.hpp"
+ #include "parameter.hpp"
++#include "df.hpp"
+ #include "sf.hpp"
+ #include "wavevector.hpp"
+ 
+@@ -112,6 +113,7 @@ class Simulation {
+   Measurement MSR;
+   CalcTimer calctimer;
+   SF sf;
++  DF df;
+   CF cf;
+   CK ck;
+   Worm W;

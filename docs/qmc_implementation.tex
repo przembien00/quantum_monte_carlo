@@ -298,7 +298,7 @@ quantum_monte_carlo/
 |-- external_dsqss/         vendored DSQSS 2.0.6 (GPLv3), patched
 |-- dsqss_install/          build output (dla, dla_pre, ...)
 |-- patches/
-|   `-- cf_antisymmetric.patch    adds the C^xy channel to the engine
+|   `-- dsqss_estimators.patch    adds the C^xy channel to the engine
 |-- qmc/
 |   |-- lattice.py          lattice definitions; DSQSS input + coupling file
 |   |-- parse.py            readers for cf.dat / sf output / disp.xml
@@ -526,7 +526,7 @@ the last sum running over the full Brillouin zone with uniform weight.
 
 \subsection{What it adds}
 
-\code{patches/cf\_antisymmetric.patch} (about 50 lines against DSQSS 2.0.6) adds
+\code{patches/dsqss\_estimators.patch} (about 50 lines against DSQSS 2.0.6) adds
 a second, \emph{signed} histogram to the \code{CF} class. Where the existing
 accumulator increments by $+1$ per event, the new one increments by the worm-head
 type $\pm1$, so it accumulates

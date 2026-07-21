@@ -106,8 +106,8 @@ class PeriodicLattice:
             group.attrs["num_Spins"] = self.nsites
         return path
 
-    def std_toml(self, beta, ntau, h_z=0.0, mc=None, seed=31415, dispfile="disp.xml",
-                 wvfile="wv.xml"):
+    def std_toml(self, beta, ntau, h_z=0.0, mc=None, seed=31415,
+                 dispfile="disp.xml"):
         """Render the DSQSS ``std.toml`` input for this lattice."""
         mc = mc or {}
         size = self.size[0] if self.dim == 1 else self.size
@@ -134,13 +134,18 @@ class PeriodicLattice:
             f"ndecor = {mc.get('ndecor', 1000)}",
             f"nmcs = {mc.get('nmcs', 20000)}",
             f"seed = {int(seed)}",
-            f'dispfile = "{dispfile}"',
-            f'wvfile = "{wvfile}"',
-            "",
-            "[kpoints]",
-            "ksteps = 1",
             "",
         ]
+        # Neither dispfile nor wvfile is declared here, and both are deliberate.
+        #
+        # wvfile / [kpoints]: C^zz is measured directly in real space on the
+        # displacement classes, so the Brillouin-zone machinery is unused --
+        # that removes the O(N^2) wavevector file and the O(N^2) structure
+        # factor measurement.
+        #
+        # dispfile: dla_pre would enumerate all N^2 site pairs in Python before
+        # writing them out. The caller writes a file holding only the requested
+        # classes and points param.in at it afterwards (see run.run_dsqss).
         return "\n".join(lines)
 
 

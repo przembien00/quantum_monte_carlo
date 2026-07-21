@@ -10,7 +10,7 @@ diagonalization, not assumed; `validate_ed.py` re-checks all of them.
 |---|---|---|
 | `C^xx = C^yy` | worm head-tail displacement histogram | `cf.dat`, `C<kind>t<itau>` |
 | `C^xy = -C^yx` | same histogram weighted by worm-head type (patched) | `cf.dat`, `A<kind>t<itau>` |
-| `C^zz` | inverse Fourier transform of `S^zz(k, tau)` | structure-factor output, `C<ik>t<itau>` |
+| `C^zz` | real-space S^z S^z estimator (patched) | `cf.dat`, `D<kind>t<itau>` |
 
 `disp.xml` assigns an ordered site pair to a displacement bin, and DSQSS
 normalizes by the number of pairs per bin, so the measured quantity is already
@@ -30,7 +30,7 @@ independent of field.
 
 Consequence: `C^xx` is available from the stock build, but `C^xy` — the
 antisymmetric combination, which is nonzero only at finite field — is not.
-`patches/cf_antisymmetric.patch` adds it.
+`patches/dsqss_estimators.patch` adds it.
 
 ## 2. The Marshall gauge staggers the transverse correlator
 
@@ -58,6 +58,11 @@ while `A[it]` matches only at `tau = 0`. Applied in
 `correlations._reverse_tau`.
 
 ## 4. The half Brillouin zone is not a fundamental domain in 2D or 3D
+
+**Superseded.** `C^zz` is now measured directly in real space (see *Cost* below),
+so the Brillouin zone is not used at all. The correction is recorded because it
+applied to every result produced before that change, and because the reasoning
+is a trap worth remembering.
 
 DSQSS's wavevector generator emits the product set `{0..L/2}` per dimension and
 relies on `S(k) = S(-k)` to cover the rest. That is a valid fundamental domain
@@ -100,7 +105,7 @@ lengths at least 4.
 
 ## The patch
 
-`patches/cf_antisymmetric.patch` (against DSQSS 2.0.6) adds a second, signed
+`patches/dsqss_estimators.patch` (against DSQSS 2.0.6) adds a second, signed
 histogram to `CF`, giving `1/2 [G^{+-} - G^{-+}]` alongside the existing
 symmetric one, and reported as `A<kind>t<itau>`.
 
@@ -121,3 +126,41 @@ travel.
 
 Unpatched builds still work; the converter detects the missing `A` entries and
 leaves `C^xy` zero.
+
+## Cost: why C^zz is measured in real space
+
+Reaching `C^zz(r, tau)` through the structure factor costs O(N_site * N_k) per
+time slice, and an exact back-transform needs the whole Brillouin zone
+(N_k = N_site). The measurement was therefore O(N^2) and swamped everything
+else: at a 512-site cube it was 88% of the runtime, and the fitted exponent over
+N = 64...512 was N^2.21 against N^1.00 for the sampling itself.
+
+Two changes make the whole run linear in N:
+
+1. **`disp.xml` covers only the requested displacement classes.** DSQSS's
+   generator enumerates all N^2 ordered pairs and bins them into ~N classes; a
+   run wants a handful. `parse.write_site_displacements` writes N * n_sites
+   entries instead, built by translating each site by the requested
+   displacement rather than scanning pairs. `std.toml` declares no `dispfile`,
+   so `dla_pre` skips its own O(N^2) enumeration entirely, and `param.in` is
+   pointed at the smaller file afterwards.
+
+2. **`DF` measures S^z S^z directly in real space** on those same classes
+   (`patches/dsqss_estimators.patch`, `src/dla/df.hpp`), reported as
+   `D<kind>t<itau>`. Cost is O(n_kinds * N * Ntau^2), linear in N. The
+   wavevector file and structure factor are no longer generated.
+
+Measured effect, 3D cube, beta = 1, ntau = 16, 20k sweeps, 1 rank:
+
+| L | N | before | after |
+|---|---|---|---|
+| 4 | 64 | 5.5 s | 4.4 s |
+| 8 | 512 | 223.8 s | 37.1 s |
+| 12 | 1728 | (not run) | 126.5 s |
+
+Per site per sweep the cost is now flat at ~3.6 us from N = 64 to N = 1728
+(fitted exponent N^1.02, was N^2.21).
+
+Correctness is unchanged: on identical configurations the real-space estimator
+reproduces the Fourier route to 1e-6, `C^xx` is bit-identical, and the full
+exact-diagonalization suite still passes.

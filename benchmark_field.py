@@ -7,7 +7,7 @@ exercises the components that vanish at zero field:
 
   * ``C^xx`` and ``C^zz`` separately -- they split once h_z != 0
   * ``Im C^xy`` -- purely imaginary, antisymmetric about beta/2, and measurable
-    only with the patched worm estimator (patches/cf_antisymmetric.patch)
+    only with the patched worm estimator (patches/dsqss_estimators.patch)
 
 The C^xy comparison is the one that cannot be checked by exact diagonalization
 at this size, so it is the substantive test of the patch.

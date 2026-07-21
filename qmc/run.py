@@ -111,8 +111,8 @@ def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
     print(rule, file=out, flush=True)
 
 
-def run_dsqss(lat, beta, ntau, workdir, h_z=0.0, mc=None, seed=31415, ncores=1,
-              progress=False, out=sys.stdout, style=None):
+def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
+              seed=31415, ncores=1, progress=False, out=sys.stdout, style=None):
     """Generate inputs, run dla, and return the paths of its output files.
 
     With ``progress`` the sampler's per-set output is echoed as it arrives;
@@ -128,12 +128,14 @@ def run_dsqss(lat, beta, ntau, workdir, h_z=0.0, mc=None, seed=31415, ncores=1,
     subprocess.run([_binary("dla_pre"), "std.toml"], cwd=workdir, check=True,
                    capture_output=True, text=True)
 
-    # dla_pre writes only the {0..L/2} product set, which is not a fundamental
-    # domain for k -> -k beyond one dimension. Replace it with the full zone
-    # before dla runs, so the back-transform to real space is exact.
-    parse.write_full_bz_wavevectors(
-        os.path.join(workdir, "wv.xml"), lat.size, lat.coords, comment=lat.name
+    # std.toml declares no dispfile, so dla_pre skips its O(N^2) enumeration of
+    # every site pair. Write the file covering just the requested displacement
+    # classes and point param.in at it.
+    dispfile = "disp.xml"
+    parse.write_site_displacements(
+        os.path.join(workdir, dispfile), lat, list(spin_sites)
     )
+    _set_param(os.path.join(workdir, "param.in"), "dispfile", dispfile)
 
     command = [_binary("dla"), "param.in"]
     if ncores > 1:
@@ -168,6 +170,19 @@ def run_dsqss(lat, beta, ntau, workdir, h_z=0.0, mc=None, seed=31415, ncores=1,
     }
 
 
+def _set_param(path, key, value):
+    """Set ``key = value`` in a dla ``param.in``, appending it if absent."""
+    lines = open(path).read().splitlines()
+    for index, line in enumerate(lines):
+        if line.split("=")[0].strip() == key:
+            lines[index] = f"{key} = {value}"
+            break
+    else:
+        lines.append(f"{key} = {value}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def _find_sf_output(workdir):
     """Locate the structure-factor output named in param.in."""
     param = os.path.join(workdir, "param.in")
@@ -198,28 +213,22 @@ def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
     if has_xy:
         cxy, cxy_err = correlations.xy_from_antisymmetric(af_mean, af_err)
 
-    czz = czz_err = None
-    if outputs["sf"]:
-        kvecs = parse.wavevector_list(lat.size)
-        sf_results = parse.read_results(outputs["sf"])
-        sf_mean, sf_err = parse.collect_tau_series(sf_results, "C", len(kvecs), ntau)
-        if np.any(np.isnan(sf_mean)) and not np.all(np.isnan(sf_mean)):
-            missing = int(np.isnan(sf_mean).any(axis=1).sum())
-            raise RuntimeError(
-                f"structure factor covers only {len(kvecs) - missing} of "
-                f"{len(kvecs)} wavevectors. The back-transform to real space "
-                "needs the full Brillouin zone; a partial zone would silently "
-                "drop the k it does not cover. Was wv.xml overwritten?"
-            )
-        if not np.all(np.isnan(sf_mean)):
-            czz, czz_err = correlations.zz_from_structure_factor(
-                sf_mean, sf_err, kvecs, lat.size, lat.coords
-            )
-
-    if czz is None:
+    # C^zz comes from the patched real-space estimator, reported as D entries
+    # on the same displacement classes as the transverse channel. The older
+    # route (Fourier transform of the structure factor over the full Brillouin
+    # zone) gave the same answer but cost O(N^2); see docs/estimators.md.
+    czz, czz_err = parse.collect_tau_series(cf_results, "D", nkinds, ntau)
+    if np.all(np.isnan(czz)):
         raise RuntimeError(
-            "no structure-factor output, so C^zz could not be computed. Check "
-            f"that dla wrote its sfoutfile in {os.path.dirname(outputs['cf'])}."
+            "no D entries in the correlation output, so C^zz is unavailable. "
+            "The engine build is missing the real-space S^z S^z estimator; "
+            "apply patches/dsqss_estimators.patch and rebuild."
+        )
+    if np.any(np.isnan(czz)):
+        raise RuntimeError(
+            f"real-space C^zz covers only "
+            f"{nkinds - int(np.isnan(czz).any(axis=1).sum())} of {nkinds} "
+            "displacement classes; the output looks truncated."
         )
 
     # Always class C. Both channels are measured on every run, so emitting the
@@ -243,9 +252,9 @@ def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
             stds_im[index, 1] = cxy_err[kind]
             corr_im[index, 2] = -stagger * cxy[kind]
             stds_im[index, 2] = cxy_err[kind]
-        if czz is not None:                      # zz
-            corr_re[index, 3] = czz[site]
-            stds_re[index, 3] = czz_err[site]
+        # C^zz is diagonal and so gauge-invariant: no staggering.
+        corr_re[index, 3] = czz[kind]
+        stds_re[index, 3] = czz_err[kind]
 
     params = {
         "num_Spins": np.int32(lat.nsites),
@@ -302,8 +311,9 @@ def run(lattice_spec, beta, ntau, spin_sites=None, h_z=0.0, J=1.0, mc=None,
     workdir = workdir or os.path.join(
         ".qmc_work", f"{lat.name}__beta={beta}__h={h_z}__seed={seed}"
     )
-    outputs = run_dsqss(lat, beta, ntau, workdir, h_z=h_z, mc=mc, seed=seed,
-                        ncores=ncores, progress=progress, out=out, style=style)
+    outputs = run_dsqss(lat, beta, ntau, workdir, spin_sites=spin_sites,
+                        h_z=h_z, mc=mc, seed=seed, ncores=ncores,
+                        progress=progress, out=out, style=style)
     params, corr_re, corr_im, stds_re, stds_im = convert(
         lat, beta, ntau, outputs, spin_sites, h_z=h_z, mc=mc, ncores=ncores,
         seed=seed, project_name=project_name, extension=extension,
