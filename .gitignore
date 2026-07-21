@@ -3,10 +3,11 @@ external_dsqss/
 dsqss_install/
 venv/
 
-# Simulation output and figures
-Data/
+# Figures are regenerated from the data by plot_benchmark*.py
 Plots/
-*.hdf5
+
+# Data/ is tracked: the HDF5 output is small (tens of KB per run) and the
+# benchmark results are worth keeping alongside the code that produced them.
 
 # Scratch directories from runs and validation
 .qmc_work/
