@@ -77,18 +77,20 @@ Therefore:
 | array tasks (`--array`) | **different** parameter points, running concurrently |
 
 Sixteen ranks gives 4x smaller error bars than one; much beyond that trades
-poorly against queue wait. Give each array task a distinct `--seed` so the
-chains are independent.
+poorly against queue wait. Seeds are drawn fresh per run and offset per rank, so
+array tasks are independent without any action; set `--seed` only when you want
+a scan to be reproducible.
 
 ## Running
 
 ```bash
 ./venv/bin/python run_qmc.py \
   --lattice=square:4x4 --beta=3 --num_TimePoints=100 \
-  --sites=0,1,5 --h_z=0.0 --cores=4
+  --sites=0,1,2 --h_z=0.0 --cores=4
 ```
 
-Writes `Data/ISO__Square_NN_PBC_N=16__sites=0-1-5__beta=3.hdf5`.
+Writes `Data/ISO__Square_NN_PBC_N=16__sites=0-1-5__beta=3.hdf5`
+(shells 0, 1, 2 resolve to sites 0, 1, 5 on this lattice).
 
 ### Where the data goes
 
