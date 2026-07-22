@@ -60,11 +60,14 @@ quantum_monte_carlo/
 |   |-- storage.py             HDF5 writer in the Chebyshev schema
 |   |-- console.py             terminal styling for the run log
 |   `-- run.py                 orchestration; ties all of the above together
+|-- install.sh                 builds the whole stack; ends in a smoke test
+|-- submit_slurm.sh            SLURM array-job template for parameter scans
 |-- run_qmc.py                 command-line entry point
 |-- validate_ed.py             correctness harness (exact diagonalization)
 |-- benchmark_vs_chebyshev.py  benchmark at zero field, three sites
 |-- benchmark_field.py         benchmark at finite field, all four components
-`-- plot_benchmark.py          figures for the zero-field benchmark
+|-- plot_benchmark.py          figures for the zero-field benchmark
+`-- plot_benchmark_field.py    figures for the finite-field benchmark
 \end{lstlisting}
 
 \subsection{Dependency structure}
@@ -102,8 +105,9 @@ A single run passes through the package in this order:
   \item \code{run.run} resolves parameters and calls \code{run.run\_dsqss}.
   \item \code{lattice.std\_toml} renders the DSQSS input; \code{dla\_pre}
     expands it into DSQSS's XML files.
-  \item \code{parse.write\_full\_bz\_wavevectors} overwrites one of those files
-    (\code{wv.xml}) to fix a Brillouin-zone coverage bug.
+  \item \code{parse.write\_site\_displacements} writes a \code{disp.xml} covering
+    only the requested displacement classes, and \code{run.\_set\_param} points
+    \code{param.in} at it.
   \item \code{dla} runs; its progress is streamed through
     \code{run.\_echo\_progress} and \code{console.Style}.
   \item \code{parse.read\_results} and \code{parse.read\_displacement\_kinds}
@@ -175,6 +179,14 @@ Member & Role \\
   $(-1)^{\sum_d r_d}$. Undoes the sublattice gauge DSQSS uses to make the
   antiferromagnet sign-free; applied to transverse components only, and only
   for $J>0$. \\
+\code{neighbour\_shells()} &
+  Sites grouped by distance from site 0, nearest first, each entry carrying the
+  representative site, its displacement, the members, and whether they are
+  symmetry-equivalent. The last flag matters on anisotropic lattices, where
+  $(1,0)$ and $(0,1)$ sit at equal distance but differ physically. \\
+\code{shell\_sites(shells)} &
+  Translates n-th-neighbour indices into site indices, which is what
+  \code{--sites} accepts. Raises naming the available range. \\
 \code{write\_coupling\_file(path)} &
   Writes \code{all/J\_ij} plus the \code{num\_Spins} attribute --- the
   Chebyshev \code{Couplings/} format. \code{h5py} is imported inside the method
@@ -210,11 +222,12 @@ Function & Role \\
   Reads \code{disp.xml}, mapping each ordered site pair to its displacement bin.
   Uses a regular expression rather than an XML parser because the file is not
   well-formed XML --- it has bare comments and repeated top-level tags. \\
-\code{wavevector\_list(size)} &
-  The \emph{full} Brillouin zone as integer $k$ indices. \\
-\code{write\_full\_bz\_wavevectors(...)} &
-  Writes a \code{wv.xml} covering every $k$, replacing the one \code{dla\_pre}
-  generates. \\
+\code{write\_site\_displacements(...)} &
+  Writes a \code{disp.xml} holding only the displacement classes actually
+  requested. DSQSS's own generator enumerates all $N^2$ ordered pairs, making
+  both the file and the per-step accumulator loop quadratic; a run needs a
+  handful. Built by translating each site by the wanted displacement rather than
+  scanning pairs, so it is $O(N \times n_{\text{sites}})$. \\
 \code{collect\_tau\_series(...)} &
   Gathers \code{<prefix><kind>t<itau>} entries into \code{(nkinds, ntau)} arrays.
   Missing entries become NaN rather than zero, so a truncated or partial output
@@ -261,10 +274,11 @@ Object & Role \\
   because the worm bins the head--tail time displacement with the opposite
   orientation; that is invisible in the symmetric channel (even about
   $\beta/2$) but negates this one. \\
-\code{zz\_from\_structure\_factor(...)} &
-  Inverse Fourier transform of $S^{zz}(k,\tau)$ to real space. Validates that
-  the $k$ grid spans the full zone, checks the input for finiteness, performs
-  the transform under a suppressed-warning block, then checks the output again. \\
+\emph{(no $C^{zz}$ entry)} &
+  $C^{zz}$ needs no conversion: the patched real-space estimator reports it
+  directly as \code{D<kind>t<itau>} and \code{run.convert} reads it through.
+  Earlier versions inverse-Fourier-transformed the structure factor here, which
+  was correct but $O(N^2)$. \\
 \code{mirror\_to\_full\_beta(...)} &
   Extends a $[0,\beta)$ series to $\tau=\beta$, with a sign flip for
   antisymmetric components. \\
@@ -358,14 +372,25 @@ overwrites \code{wv.xml} with the full Brillouin zone, then runs \code{dla}
 The subprocess is \emph{streamed} rather than captured, so progress appears
 while the sampler runs instead of arriving in one lump at the end. The full log
 is still retained in memory so that a non-zero exit can be reported with
-context. \code{\_find\_sf\_output} locates the structure-factor file by reading
-the name back out of \code{param.in}, rather than assuming it.
+context. \code{\_set\_param} edits \code{param.in} in place, which is how the trimmed
+\code{disp.xml} is substituted for the one \code{dla\_pre} would have built:
+\code{std.toml} declares no \code{dispfile}, so the generator skips its own
+$O(N^2)$ enumeration entirely.
 
 \code{\_SET\_DONE} and \code{\_NCYC} are the regular expressions that recognise
 DSQSS's own progress chatter; \code{\_echo\_progress} reformats a matching line
 into a progress bar and returns whether it recognised it.
 \code{\_format\_seconds} renders durations as \code{45s}, \code{2m31s},
 \code{1h04m}.
+
+\subsubsection*{Seeding}
+
+\code{resolve\_seed} draws from OS entropy when no seed is given. A fixed
+default made every run of the same parameters replay one chain, so repeating a
+run added nothing while the \code{X}-suffix naming presented it as a second
+result. \code{run\_dsqss} returns the seed it used and \code{convert} records
+that, rather than resolving its own --- otherwise a direct \code{convert()} call
+would store a seed that never reached the sampler.
 
 \subsubsection*{Converting}
 
@@ -409,6 +434,31 @@ cores). It adds \code{--write-couplings} to emit the matching coupling file, and
 Configuration errors (\code{ValueError}) are caught and printed as a single line
 with exit code 2; a traceback would add nothing for a mistyped lattice spec or
 an out-of-range site.
+
+\subsection{\file{install.sh} --- building the stack}
+
+Fetches DSQSS at a pinned tag, applies the estimator patch, builds against a
+project-local venv, links the \code{dsqss} Python package into it, and finishes
+with a smoke test asserting $C^{xx}(0)=\tfrac14$ exactly, $C^{xx}=C^{zz}$ at
+zero field, and the presence of all three channels. That test earned its place
+on the first run by catching a half-patched build.
+
+The reset before patching is a hard reset \emph{and} a clean: restoring tracked
+files alone leaves behind the files the patch adds, and the tree then looks
+patched to a file-existence check while the tracked edits are gone.
+
+Two properties of the result constrain its use, and the script reports both.
+\code{dla} links dynamically against the MPI it was built with, so batch jobs
+must load the same module; and the generated helper scripts carry an absolute
+shebang to \code{venv/bin/python}, so the directory cannot be moved afterwards.
+
+\subsection{\file{submit\_slurm.sh} --- batch template}
+
+A parameter scan as an array job. The division of labour follows from the
+sampler: ranks are independent chains combined only at the end, so ranks within
+a task buy error bars and array tasks buy throughput. Seeds are drawn per run
+and offset per rank, so tasks are independent without intervention; the template
+sets \code{--seed} explicitly only to make a scan reproducible.
 
 \subsection{\file{validate\_ed.py} --- the correctness harness}
 
@@ -469,10 +519,16 @@ at all --- those runs are reported as absolute agreement only, in a separate
 block, rather than inventing a reference error. \code{AVAILABLE} records which
 $(h_z, J)$ combinations exist and at which $\beta$.
 
-\subsection{\file{plot\_benchmark.py} --- figures}
+\subsection{\file{plot\_benchmark.py} and \file{plot\_benchmark\_field.py} --- figures}
 
-Produces one figure per coupling sign: correlations on top, pull underneath, one
-column per site, all inverse temperatures overlaid. Plotted against $\tau/\beta$
+The zero-field script produces one figure per coupling sign: correlations on
+top, pull underneath, one column per site, all inverse temperatures overlaid.
+The field script does the same per $(h_z, J)$ with one column per component, and
+omits the pull panel where the reference stores no uncertainties. It also
+carries a \code{KNOWN\_BAD} set naming the $h_z=2$ reference files that a
+superseded version of the Chebyshev code wrote with the coupling signs swapped
+and $C^{xy}$ inverted; those are corrected on load, as a pure relabelling with
+no fitted parameters, and the figure says so. Plotted against $\tau/\beta$
 so every temperature shares the horizontal range $[0,\tfrac12]$, which makes the
 approach to the symmetry point at $\beta/2$ line up across temperatures and lets
 the pull traces be read as flat bands. $\tau=0$ is dropped from the pull panel
