@@ -20,23 +20,65 @@ QMC gives imaginary time only; real-time data needs analytic continuation.
 ## Setup
 
 ```bash
-python3 -m venv venv
-./venv/bin/pip install toml numpy scipy h5py matplotlib
-
-git clone --depth 1 https://github.com/issp-center-dev/dsqss.git external_dsqss
-cd external_dsqss
-git apply ../patches/dsqss_estimators.patch     # enables the C^xy channel
-cmake -S . -B build \
-  -DCMAKE_INSTALL_PREFIX=$PWD/../dsqss_install \
-  -DPython3_EXECUTABLE=$PWD/../venv/bin/python \
-  -DTesting=OFF
-cmake --build build -j8 && cmake --install build
-cd ..
-
-# let the venv find the installed dsqss python package
-echo "$PWD/dsqss_install/lib/python3.13/site-packages" \
-  > "$(./venv/bin/python -c 'import site;print(site.getsitepackages()[0])')/dsqss.pth"
+./install.sh
 ```
+
+Builds everything into the repository: `external_dsqss/` (patched source),
+`dsqss_install/` (binaries), `venv/` (Python). It checks prerequisites, applies
+the estimator patch, builds, links the `dsqss` package into the venv, and
+finishes with a smoke test that asserts `C^xx(0) = 1/4` exactly, `C^xx = C^zz`
+at zero field, and that all three channels are present.
+
+`JOBS=16 ./install.sh` sets the build parallelism; `PYTHON=python3.11
+./install.sh` picks the interpreter; `DSQSS_VERSION=v2.0.6` pins the engine.
+
+### On a compute cluster
+
+Run the installer **on a login node** — compute nodes are usually offline and
+the build clones DSQSS and pip-installs wheels. Load your site's modules first;
+the names vary, so check `module avail`:
+
+```bash
+module load gcc openmpi cmake python     # site-specific names
+mkdir -p logs && ./install.sh
+```
+
+Two properties of the build constrain how you use the result, and both bite
+silently if ignored:
+
+- **`dla` is dynamically linked against the MPI you build with.** Batch jobs
+  must load the *same* MPI module as the install did. The installer prints the
+  library it linked against; a mismatch usually shows up as a loader error, but
+  can also produce a job that runs on one rank while claiming many.
+- **The helper scripts carry an absolute shebang to `venv/bin/python`.** The
+  directory cannot be moved after installing — rerun `./install.sh` instead.
+  This also means a venv on `$HOME` and a repository on scratch will break if
+  scratch is purged.
+
+If your `$HOME` has a small quota, put the whole repository on a work
+filesystem; the install is ~200 MB, dominated by the DSQSS checkout.
+
+### Batch jobs
+
+`submit_slurm.sh` is a working SLURM array-job template. Submit with:
+
+```bash
+mkdir -p logs && sbatch submit_slurm.sh
+```
+
+The structure follows from how the sampler parallelises. **MPI ranks are
+independent Markov chains**, combined only at the end, so ranks buy statistics,
+not speed — measured at 19.2 s on 1 rank versus 21.6 s on 4 for the same job.
+Therefore:
+
+| axis | use it for |
+|---|---|
+| ranks within a task (`--ntasks`) | error bars on **one** parameter point (~1/sqrt(ranks)) |
+| array tasks (`--array`) | **different** parameter points, running concurrently |
+
+Sixteen ranks gives 4x smaller error bars than one; much beyond that trades
+poorly against queue wait. Give each array task a distinct `--seed` so the
+chains are independent.
 
 ## Running
 
