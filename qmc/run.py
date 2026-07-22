@@ -70,8 +70,28 @@ def _echo_progress(line, out, style):
     return False
 
 
+def _describe_sites(lat, spin_sites, spin_shells):
+    """Render the sites line, naming the shell each site stands for."""
+    table = {s: (n, dr) for n, (_, s, dr, _, _) in enumerate(lat.neighbour_shells())}
+    names = {0: "on-site", 1: "nearest", 2: "next-nearest"}
+    parts, mixed = [], []
+    for site in spin_sites:
+        n, dr = table.get(site, (None, lat.displacement_vector(0, site)))
+        label = f"site {site}"
+        if n is not None:
+            label += f" = shell {n}"
+            if n in names:
+                label += f" ({names[n]})"
+        parts.append(f"{label} {tuple(dr)}")
+    if spin_shells is not None:
+        for n, (_, _, _, _, uniform) in enumerate(lat.neighbour_shells()):
+            if n in spin_shells and not uniform:
+                mixed.append(n)
+    return parts, mixed
+
+
 def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
-                 out=sys.stdout, style=None):
+                 spin_shells=None, out=sys.stdout, style=None):
     """Summarize what is about to be run.
 
     The destination is deliberately not shown here: the name is only settled
@@ -84,7 +104,7 @@ def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
     ntherm = mc.get("ntherm", 1000)
     geometry = "x".join(str(x) for x in lat.size)
     order = "antiferromagnetic" if lat.J > 0 else "ferromagnetic"
-    sites = ", ".join(str(s) for s in spin_sites)
+    described, mixed = _describe_sites(lat, spin_sites, spin_shells)
 
     # (label, emphasised value, trailing detail)
     rows = [
@@ -95,7 +115,10 @@ def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
         ("field", f"h_z = {h_z:g}", ""),
         ("temperature", f"beta = {beta:g}", ""),
         ("imaginary time", f"{ntau} points", f"delta_tau = {beta / ntau:.4g}"),
-        ("sites", sites, "each correlated with site 0"),
+        ("correlations", described[0], "displacement from site 0"),
+    ]
+    rows += [("", d, "") for d in described[1:]]
+    rows += [
         ("sampling", f"{nset} x {nmcs} sweeps", f"{ntherm} thermalization"),
         ("parallel", f"{ncores} MPI rank" + ("s" if ncores != 1 else ""), ""),
         ("seed", f"{seed}", ""),
@@ -108,6 +131,11 @@ def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
     for label, value, detail in rows:
         tail = f"  {detail}" if detail else ""
         print(f"  {label:<{width}}  {style.value(value)}{tail}", file=out)
+    if mixed:
+        which = ", ".join(str(n) for n in mixed)
+        print(f"  {style.warn('note:')} on this lattice shell {which} contains "
+              f"displacements that are not symmetry-equivalent (the sides have "
+              f"different lengths); the one shown above is measured.", file=out)
     print(rule, file=out, flush=True)
 
 
@@ -183,6 +211,12 @@ def _set_param(path, key, value):
         f.write("\n".join(lines) + "\n")
 
 
+def _shells_of(lat, spin_sites):
+    """Neighbour-shell index of each site, or -1 if it is not a shell head."""
+    table = {s: n for n, (_, s, _, _, _) in enumerate(lat.neighbour_shells())}
+    return [table.get(s, -1) for s in spin_sites]
+
+
 def _find_sf_output(workdir):
     """Locate the structure-factor output named in param.in."""
     param = os.path.join(workdir, "param.in")
@@ -198,7 +232,7 @@ def _find_sf_output(workdir):
 
 
 def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
-            seed=31415, project_name="", extension=""):
+            seed=31415, project_name="", extension="", spin_shells=None):
     """Assemble the correlation tensor and the parameter block for storage."""
     kinds = parse.read_displacement_kinds(outputs["disp"])
     nkinds = max(kinds.values()) + 1
@@ -263,6 +297,14 @@ def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
         "spin_model": "ISO",
         "rescale": np.float64(1.0),
         "spin_sites": ",".join(str(s) for s in spin_sites),
+        # Which neighbour shell each stored site stands for, so the file is
+        # readable without reconstructing the lattice geometry.
+        "spin_shells": ",".join(
+            str(n) for n in (spin_shells if spin_shells is not None
+                             else _shells_of(lat, spin_sites))),
+        "spin_displacements": ";".join(
+            ",".join(str(x) for x in lat.displacement_vector(0, s))
+            for s in spin_sites),
         "evol_type": "imaginary",
         "Tmax": np.float64(beta),
         "beta": np.float64(beta),
@@ -281,11 +323,14 @@ def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
     return params, corr_re, corr_im, stds_re, stds_im
 
 
-def run(lattice_spec, beta, ntau, spin_sites=None, h_z=0.0, J=1.0, mc=None,
-        seed=31415, ncores=1, workdir=None, data_dir="Data", project_name="",
-        extension="", keep_workdir=False, progress=True, out=sys.stdout):
+def run(lattice_spec, beta, ntau, spin_sites=None, spin_shells=None, h_z=0.0,
+        J=1.0, mc=None, seed=31415, ncores=1, workdir=None, data_dir="Data",
+        project_name="", extension="", keep_workdir=False, progress=True,
+        out=sys.stdout):
     """End-to-end: run QMC on a periodic lattice and write one HDF5 file."""
     lat = lattice_mod.build(lattice_spec, J=J)
+    if spin_shells is not None and spin_sites is None:
+        spin_sites = lat.shell_sites(spin_shells)
     spin_sites = list(spin_sites) if spin_sites else [0]
     for site in spin_sites:
         if not 0 <= site < lat.nsites:
@@ -306,7 +351,7 @@ def run(lattice_spec, beta, ntau, spin_sites=None, h_z=0.0, J=1.0, mc=None,
     style = console.Style(stream=out)
     if progress:
         print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
-                     out=out, style=style)
+                     spin_shells=spin_shells, out=out, style=style)
 
     workdir = workdir or os.path.join(
         ".qmc_work", f"{lat.name}__beta={beta}__h={h_z}__seed={seed}"
@@ -317,6 +362,7 @@ def run(lattice_spec, beta, ntau, spin_sites=None, h_z=0.0, J=1.0, mc=None,
     params, corr_re, corr_im, stds_re, stds_im = convert(
         lat, beta, ntau, outputs, spin_sites, h_z=h_z, mc=mc, ncores=ncores,
         seed=seed, project_name=project_name, extension=extension,
+        spin_shells=spin_shells,
     )
 
     # Resolved only now: the destination is settled at write time, so the name

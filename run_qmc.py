@@ -22,7 +22,12 @@ def main(argv=None):
     parser.add_argument("--num_TimePoints", type=int, default=100,
                         dest="ntau", help="number of imaginary-time points")
     parser.add_argument("--sites", default="0",
-                        help="comma-separated target sites, correlated with site 0")
+                        help="comma-separated neighbour shells: 0 is the "
+                             "on-site autocorrelation, 1 nearest neighbour, "
+                             "2 next-nearest, and so on")
+    parser.add_argument("--site-indices", action="store_true",
+                        help="interpret --sites as raw site indices instead of "
+                             "neighbour shells")
     parser.add_argument("--h_z", type=float, default=0.0, help="longitudinal field")
     parser.add_argument("--J", type=float, default=1.0,
                         help="coupling; positive is antiferromagnetic")
@@ -41,16 +46,22 @@ def main(argv=None):
                         help="suppress the parameter banner and progress output")
     args = parser.parse_args(argv)
 
-    sites = [int(s) for s in args.sites.split(",") if s.strip() != ""]
+    requested = [int(s) for s in args.sites.split(",") if s.strip() != ""]
 
     try:
+        lat = lattice_mod.build(args.lattice, J=args.J)
         if args.write_couplings:
-            lat = lattice_mod.build(args.lattice, J=args.J)
             lat.write_coupling_file(args.write_couplings)
             print(f"wrote coupling file {args.write_couplings}")
 
+        # --sites names neighbour shells by default; the rest of the code works
+        # in site indices, so translate once, here.
+        shells = None if args.site_indices else requested
+        sites = requested if args.site_indices else lat.shell_sites(requested)
+
         path = run_mod.run(
-            args.lattice, args.beta, args.ntau, spin_sites=sites, h_z=args.h_z,
+            args.lattice, args.beta, args.ntau, spin_sites=sites,
+            spin_shells=shells, h_z=args.h_z,
             J=args.J, seed=args.seed, ncores=args.cores,
             mc={"nmcs": args.nmcs, "nset": args.nset, "ntherm": args.ntherm},
             data_dir=args.data_dir, project_name=args.project,

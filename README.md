@@ -141,7 +141,7 @@ side overwrites the four-`X` file.)
 | `--lattice` | *required* | `chain:L`, `square:LxL`, `cube:LxLxL`. A single number expands over all dimensions (`square:4` = `square:4x4`); explicit forms may be anisotropic (`square:8x4`). Always periodic. |
 | `--beta` | *required* | Inverse temperature. |
 | `--num_TimePoints` | `100` | Number of imaginary-time points on `[0, beta)`; sets `delta_t = beta/ntau`. |
-| `--sites` | `0` | Comma-separated target sites, each correlated with site 0. |
+| `--sites` | `0` | Comma-separated **neighbour shells**: 0 on-site, 1 nearest, 2 next-nearest, ... See below. |
 | `--h_z` | `0.0` | Uniform longitudinal field. Nonzero makes `C^xx != C^zz` and turns on the purely imaginary `C^xy`. |
 | `--J` | `1.0` | Coupling. **Positive is antiferromagnetic**, negative is ferromagnetic. |
 | `--cores` | `1` | MPI ranks (`mpirun -n`). Ranks are independent Markov chains, combined in the error analysis. |
@@ -153,6 +153,7 @@ side overwrites the four-`X` file.)
 | `--project` | *(none)* | Subdirectory under the output root. |
 | `--extension` | *(none)* | Suffix appended to the filename. |
 | `--write-couplings PATH` | *(none)* | Also write the matching `J_ij` file in Chebyshev `Couplings/` format. Same lattice object drives both, so site indexing agrees by construction. |
+| `--site-indices` | off | Interpret `--sites` as raw site indices instead of shells. |
 | `--keep-workdir` | off | Keep the scratch directory with the raw DSQSS input and output (`std.toml`, `cf.dat`, `disp.xml`, ...) instead of deleting it. Useful for debugging. |
 | `--quiet` | off | Suppress the parameter banner and progress output; only the written path is printed. |
 
@@ -212,62 +213,48 @@ default of 10.
 
 ### Site numbering
 
-`--sites` takes flat integer indices in `[0, N)`. Every site is correlated with
-**site 0**, which is the origin, so `--sites=0,1,5` gives
-`<S_0(tau) S_0(0)>`, `<S_1(tau) S_0(0)>` and `<S_5(tau) S_0(0)>`, stored as
-datasets `0-0`, `1-0` and `5-0`.
+`--sites` selects **neighbour shells** measured from site 0, ordered by
+distance: `0` is the on-site autocorrelation, `1` nearest neighbour, `2`
+next-nearest, and so on. This is lattice-independent — `--sites=0,1,2` means the
+same physics on a chain, a square or a cube, with no need to know which index
+happens to sit where.
 
-The index is a **row-major (x-fastest) unpacking of the coordinates**:
+Shells are ordered by squared Euclidean distance, the usual condensed-matter
+convention, so on a square lattice shell 2 is the diagonal `(1,1)` rather than
+`(2,0)` (which is shell 3).
+
+The run prints the resolved mapping:
 
 ```
-index = x + Lx*y + Lx*Ly*z        <->        x = i % Lx,  y = (i // Lx) % Ly, ...
+  correlations    site 0 = shell 0 (on-site) (0, 0)   displacement from site 0
+                  site 1 = shell 1 (nearest) (1, 0)
+                  site 7 = shell 2 (next-nearest) (1, 1)
 ```
 
-so for `square:4x4` the lattice reads left to right, bottom to top:
+**Output is still keyed by site index** — datasets are `0-0`, `1-0`, `7-0` and
+the filename says `sites=0-1-7` — which keeps the files interchangeable with
+Chebyshev output. Three attributes record all three views: `spin_sites`,
+`spin_shells` and `spin_displacements`.
+
+Use `--site-indices` to go back to raw indices, e.g. to target a specific site
+on a lattice where the shell is not what you want.
+
+#### A caveat on anisotropic lattices
+
+A shell groups sites at equal distance, but on a lattice whose sides differ
+those are not always related by a symmetry. On a `6x4` torus the nearest
+neighbours `(1,0)` and `(0,1)` sit at the same distance yet are physically
+distinct, because the two directions have different periodicities. The
+measurement always uses the representative displacement shown in the banner, and
+the run says so:
 
 ```
-  y=3 | 12 13 14 15
-  y=2 |  8  9 10 11
-  y=1 |  4  5  6  7
-  y=0 |  0  1  2  3
-        x=0 x=1 x=2 x=3
+  note: on this lattice shell 1 contains displacements that are not
+  symmetry-equivalent (the sides have different lengths); the one shown
+  above is measured.
 ```
 
-This matches DSQSS's own `index2coord`, and — because the same
-`PeriodicLattice` object also writes the Chebyshev coupling file via
-`--write-couplings` — it matches the site numbering in that file too. The two
-codes therefore agree on what "site 5" means by construction.
-
-**Which sites to pick.** Correlations depend only on the displacement from site
-0, so useful choices are one representative per distance. For `square:4x4`:
-
-| `r^2` | Equivalent sites | Meaning |
-|---|---|---|
-| 0 | 0 | local (on-site) |
-| 1 | **1**, 3, 4, 12 | nearest neighbour |
-| 2 | **5**, 7, 13, 15 | diagonal |
-| 4 | **2**, 8 | second neighbour along an axis |
-| 5 | **6**, 9, 11, 14 | knight's-move |
-| 8 | 10 | far corner |
-
-`--sites=0,1,5,2,6,10` covers every distinct distance on this lattice.
-
-Sites within a row are related by the lattice point group, so they are
-*physically* identical but sit in **different displacement bins** and are
-measured independently. Requesting several of them is therefore a free
-consistency check (they must agree within error bars), and averaging them
-improves statistics. Verified on `square:4x4` at `beta=2`: sites 1, 3, 4 and 12
-returned `-0.10810`, `-0.10821`, `-0.10819`, `-0.10828` with error bars of
-about `8e-5`.
-
-To inspect the layout for any lattice:
-
-```python
-from qmc import lattice
-lat = lattice.build("cube:4x4x4")
-lat.coords[5]                    # coordinates of site 5
-lat.displacement_vector(0, 5)    # minimum-image displacement from site 0
-```
+On a cube or square with equal sides this never arises.
 
 ### Negative (ferromagnetic) couplings
 

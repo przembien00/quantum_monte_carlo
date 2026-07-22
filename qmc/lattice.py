@@ -96,6 +96,58 @@ class PeriodicLattice:
         """
         return -1.0 if sum(self.displacement_vector(i, j)) % 2 else 1.0
 
+    def neighbour_shells(self):
+        """Sites grouped by distance from site 0, nearest first.
+
+        Entry ``n`` is the n-th neighbour shell: 0 is the site itself, 1 the
+        nearest neighbours, 2 the next-nearest, and so on, ordered by squared
+        Euclidean distance -- the usual condensed-matter convention, in which
+        the square lattice's NNN is the diagonal (1,1) rather than (2,0).
+
+        Each entry is ``(r2, representative_site, displacement, members,
+        uniform)``. ``uniform`` is False when the shell contains displacements
+        that are *not* related by a symmetry of this lattice, which happens on
+        anisotropic lattices: on a 6x4 torus (2,0) and (0,2) are both at r2 = 4
+        but are physically distinct, because the two directions have different
+        lengths. The measurement always uses the representative's displacement,
+        so the result stays well defined; the flag exists so callers can say so.
+        """
+        groups = {}
+        for j in range(self.nsites):
+            dr = self.displacement_vector(0, j)
+            groups.setdefault(sum(x * x for x in dr), []).append((j, dr))
+
+        def signature(dr):
+            # Two displacements can only be symmetry-equivalent if the axes
+            # they use have matching lengths, so pair each component with the
+            # size of its dimension before comparing.
+            return tuple(sorted((abs(x), self.size[d]) for d, x in enumerate(dr)))
+
+        shells = []
+        for r2 in sorted(groups):
+            members = sorted(groups[r2])
+            site, dr = members[0]
+            uniform = len({signature(d) for _, d in members}) == 1
+            shells.append((r2, site, dr, [m[0] for m in members], uniform))
+        return shells
+
+    def shell_sites(self, shells):
+        """Translate n-th-neighbour indices into site indices.
+
+        Raises ValueError naming the available range if a shell does not exist,
+        which is the common mistake once the lattice is small.
+        """
+        table = self.neighbour_shells()
+        out = []
+        for n in shells:
+            if not 0 <= n < len(table):
+                raise ValueError(
+                    f"{self.name} has {len(table)} neighbour shells (0 to "
+                    f"{len(table) - 1}); shell {n} does not exist"
+                )
+            out.append(table[n][1])
+        return out
+
     def write_coupling_file(self, path):
         """Write the Chebyshev-format coupling file for this lattice."""
         import h5py
