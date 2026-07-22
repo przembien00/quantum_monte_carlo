@@ -29,10 +29,6 @@ RANKS=${SLURM_NTASKS:-1}
 
 echo "host $(hostname)   array task $i   beta=$BETA   J=$J   ranks=$RANKS"
 
-# --sites names neighbour shells: 0 on-site, 1 nearest, 2 next-nearest.
-# --seed differs per array task so the chains are independent.
-# No trailing comments inside the continued command: a '#' after a backslash
-# silently truncates the argument list rather than failing.
 "$PY" run_qmc.py \
     --lattice=cube:8x8x8 \
     --beta="$BETA" \

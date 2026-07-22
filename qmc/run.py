@@ -2,6 +2,7 @@
 
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,24 @@ _SET_DONE = re.compile(
     r"\s*ETR:\s*([\d.eE+-]+)\s*sec\.\]"
 )
 _NCYC = re.compile(r"^Determining hyperparameter NCYC\s*:\s*(\d+)")
+
+
+def resolve_seed(seed=None):
+    """Return a usable seed, drawing a fresh one when none is given.
+
+    A fixed default would make every run of the same parameters reproduce the
+    same Markov chain bit for bit, so repeating a run to gather more statistics
+    would add nothing while looking like a second independent result. Drawing
+    from OS entropy makes runs independent by default; the value used is
+    reported and stored in the output, so any run can still be reproduced
+    exactly by passing it back with --seed.
+
+    Kept well inside int32: dla adds the MPI rank index to the seed, so there
+    must be headroom above the drawn value for the number of ranks.
+    """
+    if seed is not None:
+        return int(seed)
+    return secrets.randbelow(2**30) + 1
 
 
 def _format_seconds(seconds):
@@ -140,7 +159,7 @@ def print_banner(lat, beta, ntau, spin_sites, h_z, mc, seed, ncores,
 
 
 def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
-              seed=31415, ncores=1, progress=False, out=sys.stdout, style=None):
+              seed=None, ncores=1, progress=False, out=sys.stdout, style=None):
     """Generate inputs, run dla, and return the paths of its output files.
 
     With ``progress`` the sampler's per-set output is echoed as it arrives;
@@ -148,6 +167,7 @@ def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
     failure can be reported with context.
     """
     style = style or console.Style(stream=out)
+    seed = resolve_seed(seed)
     os.makedirs(workdir, exist_ok=True)
     std_path = os.path.join(workdir, "std.toml")
     with open(std_path, "w") as f:
@@ -190,6 +210,7 @@ def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
               f"{style.value(_format_seconds(elapsed))}", file=out, flush=True)
 
     return {
+        "seed": seed,
         "cf": os.path.join(workdir, "cf.dat"),
         "sf": _find_sf_output(workdir),
         "log": os.path.join(workdir, "sample.log"),
@@ -232,7 +253,7 @@ def _find_sf_output(workdir):
 
 
 def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
-            seed=31415, project_name="", extension="", spin_shells=None):
+            seed=None, project_name="", extension="", spin_shells=None):
     """Assemble the correlation tensor and the parameter block for storage."""
     kinds = parse.read_displacement_kinds(outputs["disp"])
     nkinds = max(kinds.values()) + 1
@@ -318,17 +339,19 @@ def convert(lat, beta, ntau, outputs, spin_sites, h_z=0.0, mc=None, ncores=1,
         "original project_name": project_name,
         "method": "DSQSS/DLA worldline QMC",
         "correlation_rows": ",".join(rows),
-        "seed": np.int32(seed),
+        "seed": np.int32(seed if seed is not None
+                         else outputs.get("seed", -1)),
     }
     return params, corr_re, corr_im, stds_re, stds_im
 
 
 def run(lattice_spec, beta, ntau, spin_sites=None, spin_shells=None, h_z=0.0,
-        J=1.0, mc=None, seed=31415, ncores=1, workdir=None, data_dir="Data",
+        J=1.0, mc=None, seed=None, ncores=1, workdir=None, data_dir="Data",
         project_name="", extension="", keep_workdir=False, progress=True,
         out=sys.stdout):
     """End-to-end: run QMC on a periodic lattice and write one HDF5 file."""
     lat = lattice_mod.build(lattice_spec, J=J)
+    seed = resolve_seed(seed)
     if spin_shells is not None and spin_sites is None:
         spin_sites = lat.shell_sites(spin_shells)
     spin_sites = list(spin_sites) if spin_sites else [0]

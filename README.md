@@ -145,7 +145,7 @@ side overwrites the four-`X` file.)
 | `--h_z` | `0.0` | Uniform longitudinal field. Nonzero makes `C^xx != C^zz` and turns on the purely imaginary `C^xy`. |
 | `--J` | `1.0` | Coupling. **Positive is antiferromagnetic**, negative is ferromagnetic. |
 | `--cores` | `1` | MPI ranks (`mpirun -n`). Ranks are independent Markov chains, combined in the error analysis. |
-| `--seed` | `31415` | Random seed. Vary it for independent repeats. |
+| `--seed` | *fresh each run* | Random seed. Omit for an independent run; the value used is printed and stored in `parameters/seed`, so passing it back reproduces that run exactly. |
 | `--nmcs` | `20000` | Monte Carlo sweeps per set (measurement statistics). |
 | `--nset` | `10` | Number of sets; error bars come from the scatter between sets, so keep this at 10 or more. |
 | `--ntherm` | `1000` | Thermalization sweeps discarded before measurement. |
@@ -203,6 +203,19 @@ completed set, including when stdout is a pipe or a batch log — DSQSS flushes
 each line explicitly. There are no carriage returns or redraws, so HPC job logs
 stay readable. Error bars only become meaningful once several sets have
 finished, so `--nset` also sets the progress granularity.
+
+### Seeds and reproducibility
+
+Each run draws a fresh seed from OS entropy, so repeating a run genuinely adds
+statistics rather than reproducing the same chain. The seed is printed in the
+banner and stored in the output, so any run can be replayed exactly:
+
+```bash
+./venv/bin/python run_qmc.py ... --seed=748173299
+```
+
+MPI ranks are seeded independently — `dla` adds the rank index to the seed — so
+the chains within a run are distinct as well.
 
 A warning is printed if any error bar comes back non-finite. DSQSS forms the
 error as `sqrt(<x^2> - <x>^2)`, and with few sets on a barely fluctuating

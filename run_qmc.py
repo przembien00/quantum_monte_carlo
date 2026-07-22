@@ -32,7 +32,10 @@ def main(argv=None):
     parser.add_argument("--J", type=float, default=1.0,
                         help="coupling; positive is antiferromagnetic")
     parser.add_argument("--cores", type=int, default=1, help="MPI ranks")
-    parser.add_argument("--seed", type=int, default=31415)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="random seed. Omit for a fresh one each run; "
+                             "the value used is printed and stored, so pass "
+                             "it back to reproduce a run exactly.")
     parser.add_argument("--nmcs", type=int, default=20000, help="MC sweeps per set")
     parser.add_argument("--nset", type=int, default=10, help="number of MC sets")
     parser.add_argument("--ntherm", type=int, default=1000, help="thermalization sweeps")
