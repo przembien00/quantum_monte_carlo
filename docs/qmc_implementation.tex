@@ -248,27 +248,42 @@ $\Gpm-\Gmp$. The two orderings are related by the KMS condition
 \end{equation}
 which is what makes $C^{xx}$ even and $C^{xy}$ odd about $\beta/2$.
 
-\subsection{Longitudinal channel: the structure factor}
+\subsection{Longitudinal channel: a real-space estimator}
+\label{sec:zzreal}
 
-DSQSS has no real-space $S^zS^z$ correlator. It measures the $k$-resolved
-dynamic structure factor $S^{zz}(\mathbf{k},\tau)$ by Fourier-transforming the
-instantaneous magnetization on each time slice and correlating slices. Real
-space is recovered in the converter by an inverse transform,
+Stock DSQSS has no real-space $S^zS^z$ correlator. It offers only the
+$k$-resolved dynamic structure factor $S^{zz}(\mathbf{k},\tau)$, from which real
+space must be recovered by an inverse transform
 \begin{equation}
   C^{zz}(\mathbf{r},\tau)
   = \frac{1}{N}\sum_{\mathbf{k}\in\text{BZ}}
-      S^{zz}(\mathbf{k},\tau)\, e^{i\mathbf{k}\cdot\mathbf{r}} .
+      S^{zz}(\mathbf{k},\tau)\, e^{i\mathbf{k}\cdot\mathbf{r}} ,
   \label{eq:zzft}
 \end{equation}
-DSQSS's own generator emits only the product set
-$k_d\in\{0,\dots,L_d/2\}$, relying on
-$S^{zz}(\mathbf{k})=S^{zz}(-\mathbf{k})$ to supply the rest. As
-Section~\ref{sec:corr4} explains, that reasoning fails beyond one dimension, so
-the code here measures the \emph{full} zone instead. Every $\mathbf{k}$ then
-enters \eqref{eq:zzft} with weight one and no multiplicity bookkeeping is
-required. Since distinct $\mathbf{k}$ are independent accumulators, statistical
-errors propagate through \eqref{eq:zzft} in quadrature with the same weights
-squared.
+over the \emph{whole} Brillouin zone --- the half zone is not a fundamental
+domain beyond one dimension, as Section~\ref{sec:corr4} recounts. That route is
+correct but costs $O(N_{\text{site}} N_k)$ per time slice with
+$N_k = N_{\text{site}}$, i.e.\ $O(N^2)$, and past a few hundred sites it
+dominates every other cost in the calculation.
+
+The engine patch therefore adds the missing estimator directly
+(\code{src/dla/df.hpp}), measuring
+\begin{equation}
+  C^{zz}(\mathbf{r},\tau)
+  = \frac{1}{N_r}\sum_{(i,j)\in r} \frac{1}{N_\tau}\sum_t
+      m^z_i(t)\, m^z_j(t+\tau)
+  \label{eq:zzreal}
+\end{equation}
+on the same displacement classes the transverse channel already uses, reported
+as \code{D<kind>t<itau>}. The cost is
+$O(n_{\text{kinds}} N_{\text{pairs}} N_\tau^2)$, linear in the number of sites
+for a fixed handful of requested displacements, and the Brillouin-zone
+machinery is not needed at all. Section~\ref{sec:cost} gives the measured
+effect.
+
+Correctness was checked by running both estimators on identical configurations:
+they agree to $10^{-6}$, and $C^{xx}$ --- which the change does not touch, and
+which consumes no random numbers in either case --- comes out bit-identical.
 
 \subsection{Site averaging}
 \label{sec:siteavg}
@@ -343,7 +358,21 @@ is shared by both codes by construction. All correlations are taken with respect
 to site $0$, which sits at the coordinate origin.
 
 Correlations depend only on the displacement from site $0$, so distinct physics
-is obtained by choosing one site per distance class. Sites within a class are
+is obtained by choosing one site per distance class. The command line therefore
+selects \emph{neighbour shells} rather than raw indices: \code{--sites=0,1,2}
+means the on-site autocorrelation, the nearest neighbour and the next-nearest,
+ordered by squared Euclidean distance, so on a square lattice shell 2 is the
+diagonal $(1,1)$ and $(2,0)$ is shell 3. This is lattice-independent, and on
+\code{square:6x4} it resolves to sites $0,1,7$ --- exactly the choice the
+benchmarks of Section~\ref{sec:validation} were built on. Output remains keyed
+by site index so files stay interchangeable with Chebyshev output, with
+\code{spin\_shells} and \code{spin\_displacements} recording the other views.
+
+A shell groups sites at equal distance, which on an anisotropic lattice need not
+make them symmetry-equivalent: on a $6\times4$ torus $(1,0)$ and $(0,1)$ are
+both nearest neighbours yet differ physically, the two directions having
+different periodicities. The representative displacement is the one measured,
+and the run reports when a requested shell is of this kind. Sites within a class are
 related by the lattice point group: they are physically identical but fall in
 \emph{different} displacement bins and are measured independently, so requesting
 several of them provides a free consistency check and improves statistics when
@@ -472,6 +501,13 @@ $\code{it}\mapsto(n_\tau-\code{it})\bmod n_\tau$.
 \subsection{Correction 4: the half Brillouin zone is not a fundamental domain}
 \label{sec:corr4}
 
+\paragraph{Superseded.} $C^{zz}$ is now measured directly in real space
+(Section~\ref{sec:zzreal}), so the Brillouin zone plays no part in the current
+code and this correction no longer applies to anything it produces. It is kept
+because it governed every result obtained before that change, and because the
+reasoning is a trap worth remembering: a fundamental domain in one dimension
+need not be one in higher dimensions.
+
 \paragraph{The problem.} The product set $k_d\in\{0,\dots,L_d/2\}$ is a valid
 fundamental domain for $\mathbf{k}\to-\mathbf{k}$ in one dimension, but not in
 two or more. On a $4\times4$ lattice the orbit $\{(1,3),(3,1)\}$ lies entirely
@@ -487,9 +523,10 @@ $10^{-4}$ --- a $261\sigma$ discrepancy, plainly visible in the third digit.
 Measuring the full zone brings the same comparison to $10^{-4}$, or
 $1.5\sigma$.
 
-\paragraph{The fix.} \code{parse.write\_full\_bz\_wavevectors} overwrites the
-\code{wv.xml} produced by \code{dla\_pre} with one covering every
-$\mathbf{k}$ in the zone, before \code{dla} runs. The inverse transform is then
+\paragraph{The fix, as it then stood.} A \code{parse.write\_full\_bz\_wavevectors}
+helper (since removed along with the rest of the Fourier route) overwrote the
+\code{wv.xml} produced by \code{dla\_pre} with one covering every $\mathbf{k}$ in
+the zone, before \code{dla} ran. The inverse transform is then
 exact with uniform weight, and the multiplicity logic disappears. A partially
 populated structure factor is now a hard error rather than silently propagating
 NaN.
@@ -515,16 +552,21 @@ $s_{\mathbf r}=1$ otherwise, and $\mathcal{R}$ the $\tau$-reversal:
   \mathrm{Im}\,C^{xy}(\mathbf{r},\tau) &= \tfrac12\, s_{\mathbf r}\,
       \bigl[\mathcal{R}\,\code{af}\bigr](\mathbf{r},\tau),
       \qquad C^{yx}=-C^{xy}, \\
-  C^{zz}(\mathbf{r},\tau) &= \frac1N\sum_{\mathbf k}
-      S^{zz}(\mathbf{k},\tau)\cos(\mathbf{k}\!\cdot\!\mathbf{r}),
+  C^{zz}(\mathbf{r},\tau) &= \code{df}(\mathbf{r},\tau),
 \end{align}
-the last sum running over the full Brillouin zone with uniform weight.
+the last requiring no conversion at all: the patched real-space estimator of
+Section~\ref{sec:zzreal} reports it directly, already averaged over the site
+pairs in each displacement class.
 
 %======================================================================
 \section{The engine patch}
 \label{sec:patch}
 
 \subsection{What it adds}
+
+The patch supplies two estimators DSQSS lacks. The first is described here; the
+second, a real-space $S^zS^z$ correlator, is covered in
+Section~\ref{sec:zzreal}.
 
 \code{patches/dsqss\_estimators.patch} (about 50 lines against DSQSS 2.0.6) adds
 a second, \emph{signed} histogram to the \code{CF} class. Where the existing
@@ -630,12 +672,20 @@ are written beyond the C++ set: \code{method} records the engine, and \code{J}
 and \code{lattice\_size} record the model, which in the C++ scheme is implicit
 in the named couplings file. The Chebyshev-specific spectral bounds
 \code{E\_max} and \code{E\_min} are omitted entirely, having no QMC analogue.
+Each run draws its seed from OS entropy unless one is given, so repeating a run
+genuinely adds statistics instead of replaying the same chain; the value used is
+printed and stored in \code{parameters/seed}, making any run reproducible by
+passing it back. A fixed default had the opposite effect --- two runs of the same
+parameters produced bit-identical data while the \code{X}-suffix naming
+presented them as independent results.
+
 Error bars come from DSQSS's binning analysis over Monte Carlo sets and are
 written into the \code{\_stds} groups, matching the role of the typicality
 sampling errors in the Chebyshev output.
 
 %======================================================================
 \section{Validation}
+\label{sec:validation}
 
 \subsection{Method}
 
@@ -743,6 +793,67 @@ $0.038$ on the third measured site, and $\mathrm{Im}\,C^{xy}$ is nonzero on all
 of them.
 
 %======================================================================
+\section{Cost and scaling}
+\label{sec:cost}
+
+All figures below are measured, not modelled.
+
+\subsection{Where the time goes}
+
+Sampling is linear in the number of sites and in $\beta$. The measurement was
+not: with $C^{zz}$ obtained from the structure factor and \code{disp.xml}
+enumerating every ordered site pair, it grew as $N^{2.21}$ and reached 88\,\% of
+the runtime at a 512-site cube. Restricting the displacement file to the
+requested classes and measuring $C^{zz}$ in real space
+(Section~\ref{sec:zzreal}) removes both, leaving
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+$L$ (cube) & $N$ & before & after \\
+\midrule
+ 4 &   64 &   5.5\,s &   4.4\,s \\
+ 8 &  512 & 223.8\,s &  37.1\,s \\
+12 & 1728 &      --- & 126.5\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Per site per sweep the cost is now flat at $\sim3.6\,\mu$s from $N=64$ to
+$N=1728$ (fitted exponent $N^{1.02}$, was $N^{2.21}$).
+
+\subsection{Error scaling}
+
+The statistical error follows the ideal law to within measurement precision,
+\begin{equation}
+  \text{error} \;\approx\; A\, N^{-0.55}\, \beta^{p} \,/\, \sqrt{n_{\text{sweeps}}} ,
+\end{equation}
+with fitted exponents $-0.501$, $-0.511$, $-0.508$ in $n_{\text{sweeps}}$ for
+$xx$, $zz$ and $xy$ against the ideal $-1/2$. The $\beta$ dependence differs
+sharply by channel: $p\simeq0.72$ for $C^{xx}$, $0.19$ for $C^{xy}$ and $0.05$
+for $C^{zz}$, the last being a diagonal estimator read straight off the
+worldline with bounded per-sample variance. For $N=24$ at $\beta=3$ the
+prefactor is $A\simeq0.075$ on the noisiest channel.
+
+The $N^{-0.55}$ comes from the site averaging of Section~\ref{sec:siteavg}:
+each displacement class pools $N$ pairs. Since cost per sweep is linear in $N$
+while \emph{variance} falls as $N^{-1.1}$, the wall time needed to reach a fixed
+error is nearly independent of system size --- measured to vary by under $3\times$
+across a $64\times$ range in $N$, and if anything to decrease. This was verified
+at $\beta=1$; as $\beta$ grows and correlations lengthen, the pooled samples
+become less independent and the exponent should soften.
+
+\subsection{Parallelism and memory}
+
+MPI ranks run independent Markov chains, combined only at the end, so ranks buy
+error bars ($\sim1/\sqrt{\text{ranks}}$) and not speed: the same job took
+19.2\,s on one rank and 21.6\,s on four. Parameter scans therefore belong in
+array jobs, with ranks used within each task. \code{dla} seeds each rank as
+$\text{SEED} + I_{\text{PROC}}$, so the chains within a run are distinct.
+
+Peak resident memory is about $46\,$MB fixed plus $5\,$KB per site: 65\,MB at
+$N=4096$ and 211\,MB at $N=32768$ ($L=32$ in 3D).
+
 \section{Usage}
 
 \begin{lstlisting}
