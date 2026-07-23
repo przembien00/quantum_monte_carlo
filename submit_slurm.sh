@@ -3,8 +3,8 @@
 #SBATCH --array=0-21
 #SBATCH --ntasks=16              # MPI ranks per array task
 #SBATCH --cpus-per-task=1
-#SBATCH --partition=med
-#SBATCH --time=8:00:00
+#SBATCH --partition=long
+#SBATCH --time=48:00:00
 #SBATCH --mem-per-cpu=2G
 #SBATCH --output=logs/qmc-%A_%a.out
 #SBATCH --error=logs/qmc-%A_%a.out
@@ -31,15 +31,15 @@ RANKS=${SLURM_NTASKS:-1}
 echo "host $(hostname)   array task $i   beta=$BETA   J=$J   ranks=$RANKS"
 
 "$PY" run_qmc.py \
-    --lattice=square:50x50 \
+    --lattice=cube:32x32x32 \
     --beta="$BETA" \
     --J="$J" \
-    --h_z=0.0 \
+    --h_z=0.5 \
     --num_TimePoints=100 \
     --sites=0,1,2,3,4 \
-    --nmcs=2500 \
+    --nmcs=1250 \
     --nset=10 \
     --cores="$RANKS" \
-    --project="AFM_FM_2D"
+    --project="AFM_FM_B"
 
 echo "done"
