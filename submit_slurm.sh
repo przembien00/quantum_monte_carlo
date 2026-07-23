@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=qmc
-#SBATCH --array=0-13
+#SBATCH --array=0-21
 #SBATCH --ntasks=16              # MPI ranks per array task
 #SBATCH --cpus-per-task=1
-#SBATCH --time=02:00:00
+#SBATCH --partition=med
+#SBATCH --time=8:00:00
 #SBATCH --mem-per-cpu=2G
 #SBATCH --output=logs/qmc-%A_%a.out
 #SBATCH --error=logs/qmc-%A_%a.out
@@ -18,7 +19,7 @@ PY="$ROOT/venv/bin/python"
 
 # ---- the scan ---------------------------------------------------------------
 # One line per array index; keep the count in sync with --array above.
-BETAS=(0.2 0.5 1.0 1.5 2.0 2.5 3.0)
+BETAS=(0.2 0.5 1.0 1.5 2.0 2.5 3.0 3.5 4 4.5 5)
 COUPLINGS=(0.5 -0.5)
 
 i=${SLURM_ARRAY_TASK_ID:-0}
@@ -30,16 +31,15 @@ RANKS=${SLURM_NTASKS:-1}
 echo "host $(hostname)   array task $i   beta=$BETA   J=$J   ranks=$RANKS"
 
 "$PY" run_qmc.py \
-    --lattice=cube:8x8x8 \
+    --lattice=square:50x50 \
     --beta="$BETA" \
     --J="$J" \
     --h_z=0.0 \
-    --num_TimePoints=64 \
-    --sites=0,1,2 \
-    --nmcs=20000 \
-    --nset=20 \
+    --num_TimePoints=100 \
+    --sites=0,1,2,3,4 \
+    --nmcs=2500 \
+    --nset=10 \
     --cores="$RANKS" \
-    --project="scan_L8" \
-    --seed=$(( 31415 + i ))
+    --project="AFM_FM_2D"
 
 echo "done"
