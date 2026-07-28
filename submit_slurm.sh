@@ -51,12 +51,11 @@ echo "host $(hostname)   array task $i   beta=$BETA   J=$J   nmcs=$NMCS   ranks=
     --lattice=cube:32x32x32 \
     --beta="$BETA" \
     --J="$J" \
-    --h_z=0.5 \
     --num_TimePoints=100 \
     --sites=0,1,2,3,4 \
     --nmcs="$NMCS" \
     --nset=10 \
     --cores="$RANKS" \
-    --project="AFM_FM_B"
+    --project="AFM_FM"
 
 echo "done"
