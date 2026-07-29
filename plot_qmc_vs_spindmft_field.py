@@ -26,7 +26,8 @@ import h5py
 
 QMC_DIR = "Data/AFM_FM_B"
 DMFT_DIR = "Data/spinDMFT"
-SITES = "0-1-21-421-2"          # shells 0..4 on the 20^3 cube, N = 8000
+N_QMC = 13824                   # 24^3, the largest size complete at both signs
+SITES = "0-1-25-601-2"          # shells 0..4 on the 24^3 cube
 ROWS = ["xx", "xy", "yx", "zz"]
 H_Z = 0.5
 
@@ -73,7 +74,7 @@ def load_qmc(beta, J, row):
     endpoint flips sign.  The error bar is unchanged either way.
     """
     path = os.path.join(
-        QMC_DIR, f"ISO__Cube_NN_PBC_N=8000__sites={SITES}__beta={_fmt(beta)}"
+        QMC_DIR, f"ISO__Cube_NN_PBC_N={N_QMC}__sites={SITES}__beta={_fmt(beta)}"
                  f"__J={_fmt(J)}__h_z={_fmt(H_Z)}.hdf5")
     part = "Im" if row in ("xy", "yx") else "Re"
     with h5py.File(path) as h:
@@ -242,10 +243,10 @@ def main():
     # scale makes the two channels directly comparable.  The ferromagnet's
     # zz spans a fortieth of its xx -- linking there would flatten it.
     make_sign_figure(0.408248, C_AFM, "Antiferromagnet  $J>0$",
-                     "Plots/qmc_N8000_vs_spindmft_field_afm.png",
+                     f"Plots/qmc_N{N_QMC}_vs_spindmft_field_afm.png",
                      link=("xx", "zz"))
     make_sign_figure(-0.408248, C_FM, "Ferromagnet  $J<0$",
-                     "Plots/qmc_N8000_vs_spindmft_field_fm.png")
+                     f"Plots/qmc_N{N_QMC}_vs_spindmft_field_fm.png")
 
 
 if __name__ == "__main__":
