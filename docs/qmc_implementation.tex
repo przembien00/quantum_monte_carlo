@@ -852,7 +852,13 @@ array jobs, with ranks used within each task. \code{dla} seeds each rank as
 $\text{SEED} + I_{\text{PROC}}$, so the chains within a run are distinct.
 
 Peak resident memory is about $46\,$MB fixed plus $5\,$KB per site: 65\,MB at
-$N=4096$ and 211\,MB at $N=32768$ ($L=32$ in 3D).
+$N=4096$ and 211\,MB at $N=32768$ ($L=32$ in 3D). At low temperature a further
+contribution comes from the worldline pools, which are sized from $\beta N$
+because DSQSS preallocates them and treats an overflow as a successful exit;
+these add $\sim130\,$MB at $L=32$, $\beta=8$, for $\sim320\,$MB total. A silent
+calibration phase precedes sampling, its cost scaling with $\beta N$ --- seconds
+at $L=16$, minutes at $L=32$ --- which the run flags so it is not mistaken for a
+hang.
 
 \section{Usage}
 
