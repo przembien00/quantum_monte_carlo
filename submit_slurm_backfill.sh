@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Backfill the finite-size ladder for L < 32 (N < 32768), both fields.
+# Backfill the missing finite-size points at L > 20 (below L = 32, which has
+# its own generator).  A bug left these six holes at N = 13824 and 21952:
 #
-# A bug left the smaller lattices missing points that the L = 32 runs have:
-# the extended beta = 3.5..5 tail at every L <= 20, the whole L = 4 cube at
-# h_z = 0.5, and a handful of single holes at L = 24 and 28.  This job sweeps
-# the full ladder and SKIPS any (L, beta, J, h_z) whose output already exists,
-# so it regenerates exactly the gaps and never clobbers or duplicates a good
-# run (run_qmc.py would otherwise append an X on a name collision).
+#   AFM_FM   (h_z=0)    L=24  beta=1.5  AFM
+#   AFM_FM   (h_z=0)    L=28  beta=0.2  AFM
+#   AFM_FM_B (h_z=0.5)  L=28  beta=2    AFM
+#   AFM_FM_B (h_z=0.5)  L=28  beta=2    FM
+#   AFM_FM_B (h_z=0.5)  L=28  beta=3.5  AFM
+#   AFM_FM_B (h_z=0.5)  L=28  beta=5    FM
 #
-# Every knob -- coupling, sample counts, imaginary-time resolution -- is set to
-# match the existing files of the same size, so a backfilled point is
-# statistically consistent with the rest of its series.
+# The array is exactly these six -- one task per real job, no no-op slots.
+# Each knob (coupling, sample count, imaginary-time resolution) matches the
+# existing files of the same size, so a backfilled point is consistent with
+# the rest of its series.  A skip guard still fires if a file has appeared
+# since, so re-running is safe and never duplicates a good run.
 #
 #SBATCH --job-name=qmc-backfill
-#SBATCH --array=0-87
+#SBATCH --array=0-5
 #SBATCH --ntasks=16              # MPI ranks per array task
 #SBATCH --cpus-per-task=1
 #SBATCH --partition=long
@@ -30,62 +33,41 @@ ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
 PY="$ROOT/venv/bin/python"
 [[ -x "$PY" ]] || { echo "no venv at $PY -- run ./install.sh first" >&2; exit 1; }
 
-# ---- the ladder -------------------------------------------------------------
-# Restricted to L > 20 (below L = 32, which has its own generator).  SITE_TOK
-# is the shell 0..4 site-index token run_qmc.py bakes into the filename for
-# that lattice; NTAU = 100 matches the existing series at these sizes.
-LS=(24       28)
-NS=(13824    21952)
-TOKS=(0-1-25-601-2  0-1-29-813-2)
-NTAUS=(100      100)
+# ---- the missing points -----------------------------------------------------
+# One entry per job: "PROJECT H_Z L beta J".  Keep --array at 0 .. count-1.
+POINTS=(
+    "AFM_FM   0.0  24  1.5  0.408248"
+    "AFM_FM   0.0  28  0.2  0.408248"
+    "AFM_FM_B 0.5  28  2    0.408248"
+    "AFM_FM_B 0.5  28  2    -0.408248"
+    "AFM_FM_B 0.5  28  3.5  0.408248"
+    "AFM_FM_B 0.5  28  5    -0.408248"
+)
 
-BETAS=(0.2 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5)   # %g forms -- match the filenames
-COUPLINGS=(0.408248 -0.408248)              # 1/sqrt(6); positive = AFM, negative = FM
-PROJECTS=(AFM_FM   AFM_FM_B)                 # zero field, then h_z = 0.5
-HZS=(0.0      0.5)
+read -r PROJECT H_Z L BETA J <<< "${POINTS[${SLURM_ARRAY_TASK_ID:-0}]}"
 
-nL=${#LS[@]}; nB=${#BETAS[@]}; nS=${#COUPLINGS[@]}; nP=${#PROJECTS[@]}
-# Keep --array in sync: it must be 0 .. nL*nB*nS*nP - 1  (2*11*2*2 = 88).
+# Side length -> total spins, filename site token, imaginary-time points.
+case "$L" in
+    24) N=13824; TOK=0-1-25-601-2; NTAU=100 ;;
+    28) N=21952; TOK=0-1-29-813-2; NTAU=100 ;;
+    *)  echo "no lattice metadata for L=$L" >&2; exit 1 ;;
+esac
 
-# ---- decode the array index into (size, beta, sign, project) ----------------
-i=${SLURM_ARRAY_TASK_ID:-0}
-bi=$(( i % nB ))
-li=$(( (i / nB) % nL ))
-si=$(( (i / (nB*nL)) % nS ))
-pi=$(( (i / (nB*nL*nS)) % nP ))
+# Sample count: the big lattices use the AFM 625 / FM 1250 split (the
+# antiferromagnet is slower, so it is sampled less to keep wall times in line).
+if [[ "$J" == -* ]]; then NMCS=1250; else NMCS=625; fi
 
-L=${LS[$li]}; N=${NS[$li]}; TOK=${TOKS[$li]}; NTAU=${NTAUS[$li]}
-BETA=${BETAS[$bi]}
-J=${COUPLINGS[$si]}
-PROJECT=${PROJECTS[$pi]}; H_Z=${HZS[$pi]}
-
-# ---- sample count: match the size's series ----------------------------------
-# L <= 20 were run at 2500 sweeps for both signs; the big lattices use the
-# AFM 625 / FM 1250 split (the antiferromagnet is slower, so it is sampled
-# less to keep wall times in line).
-if (( N <= 8000 )); then
-    NMCS=2500
-elif [[ "$J" == -* ]]; then
-    NMCS=1250            # ferromagnet
-else
-    NMCS=625             # antiferromagnet
-fi
-
-# ---- skip points that already exist -----------------------------------------
-# Reconstruct the exact name run_qmc.py would write; the h_z fragment only
-# appears when the field is nonzero.
+# ---- skip if it already exists (safety against a race / re-run) -------------
 FNAME="ISO__Cube_NN_PBC_N=${N}__sites=${TOK}__beta=${BETA}__J=${J}"
 [[ "$H_Z" != "0.0" && "$H_Z" != "0" ]] && FNAME+="__h_z=${H_Z}"
 FNAME+=".hdf5"
-TARGET="$ROOT/Data/$PROJECT/$FNAME"
-
-if [[ -f "$TARGET" ]]; then
-    echo "task $i: exists, skipping  $PROJECT/$FNAME"
+if [[ -f "$ROOT/Data/$PROJECT/$FNAME" ]]; then
+    echo "task ${SLURM_ARRAY_TASK_ID:-0}: exists, skipping  $PROJECT/$FNAME"
     exit 0
 fi
 
 RANKS=${SLURM_NTASKS:-1}
-echo "task $i: host $(hostname)  L=$L N=$N beta=$BETA J=$J h_z=$H_Z  nmcs=$NMCS ntau=$NTAU  project=$PROJECT  ranks=$RANKS"
+echo "task ${SLURM_ARRAY_TASK_ID:-0}: host $(hostname)  L=$L N=$N beta=$BETA J=$J h_z=$H_Z  nmcs=$NMCS ntau=$NTAU  project=$PROJECT  ranks=$RANKS"
 
 "$PY" run_qmc.py \
     --lattice="cube:${L}x${L}x${L}" \
@@ -99,4 +81,4 @@ echo "task $i: host $(hostname)  L=$L N=$N beta=$BETA J=$J h_z=$H_Z  nmcs=$NMCS 
     --cores="$RANKS" \
     --project="$PROJECT"
 
-echo "task $i: done"
+echo "task ${SLURM_ARRAY_TASK_ID:-0}: done"
