@@ -158,6 +158,29 @@ class PeriodicLattice:
             group.attrs["num_Spins"] = self.nsites
         return path
 
+    def _pool_size(self, beta, override=None):
+        """Segment/vertex pool size for a run at this beta.
+
+        DSQSS preallocates fixed pools (default 100000) and, on exhaustion,
+        prints an error and calls exit(0) -- status *success*, so an overflow
+        would otherwise pass as a completed run. The pools must therefore be
+        large enough for the whole simulation up front.
+
+        The mean number of off-diagonal vertices is ~ |J| * beta * bonds / 4.
+        This uses several times that for headroom against fluctuations, and
+        never goes below the DSQSS default. Each element is small, so the memory
+        cost is minor next to the worldline itself.
+
+        The bond count is computed analytically -- a d-dimensional torus with
+        sides >= 3 has d*N bonds -- rather than from the coupling matrix, which
+        is N^2 and cannot be built at the sizes this guards against.
+        """
+        if override is not None:
+            return int(override)
+        bonds = self.dim * self.nsites
+        mean = abs(self.J) * beta * bonds / 4.0
+        return max(100000, int(6 * mean) + 1000)
+
     def std_toml(self, beta, ntau, h_z=0.0, mc=None, seed=31415,
                  dispfile="disp.xml"):
         """Render the DSQSS ``std.toml`` input for this lattice."""
@@ -186,6 +209,8 @@ class PeriodicLattice:
             f"ndecor = {mc.get('ndecor', 1000)}",
             f"nmcs = {mc.get('nmcs', 20000)}",
             f"seed = {int(seed)}",
+            f"nsegmax = {self._pool_size(beta, mc.get('nsegmax'))}",
+            f"nvermax = {self._pool_size(beta, mc.get('nvermax'))}",
             "",
         ]
         # Neither dispfile nor wvfile is declared here, and both are deliberate.

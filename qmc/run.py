@@ -188,6 +188,18 @@ def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
     command = [_binary("dla"), "param.in"]
     if ncores > 1:
         command = ["mpirun", "-n", str(ncores)] + command
+    # dla writes to a pipe, where C++ fully buffers stdout, so nothing appears
+    # until the first explicit flush -- which is only after the (silent, and at
+    # large beta*N slow) NCYC calibration. Forcing line buffering with stdbuf
+    # lets dla's own startup and the calibration line appear promptly. stdbuf is
+    # standard on Linux clusters; where it is absent the run still works, just
+    # without dla's intermediate output.
+    if shutil.which("stdbuf"):
+        command = ["stdbuf", "-oL", "-eL"] + command
+    if progress:
+        print(f"  {style.warn('calibrating')} "
+              f"(silent phase; scales with beta x sites, up to minutes at L=32)"
+              f"...", file=out, flush=True)
     started = time.time()
 
     # Streamed rather than captured, so progress appears while the sampler runs
@@ -202,8 +214,20 @@ def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
     returncode = proc.wait()
     elapsed = time.time() - started
 
+    text = "".join(log)
+    # A worldline-pool overflow prints "Pool> ERROR ... empty pool" and then
+    # calls exit(0), so without this check it would pass as a successful run
+    # with no correlation output. "Aborting" covers the other fatal exit(0)
+    # paths in the engine. Both strings are specific to failures; a normal run
+    # prints neither.
+    if "empty pool" in text or "Aborting" in text:
+        raise RuntimeError(
+            "dla reported a worldline-pool overflow (more segments or vertices "
+            "than the preallocated pool holds). This should not happen with the "
+            "beta-scaled pool sizes; raise nsegmax/nvermax via the mc dict if it "
+            "recurs.\n" + text[-1500:])
     if returncode != 0:
-        raise RuntimeError("dla failed:\n" + "".join(log)[-2000:])
+        raise RuntimeError("dla failed:\n" + text[-2000:])
 
     if progress:
         print(f"  {style.ok('sampling complete')} in "

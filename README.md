@@ -386,6 +386,26 @@ length >= 3** — `square:3x3 --J=-1` is the standard case. Shorter sides make
 
 ## Troubleshooting
 
+**A run prints the banner then appears to hang, never reaching "calibrated worm
+cycles per sweep".** It is almost certainly working, not stuck. Before the first
+progress line DSQSS runs a silent calibration phase (`set_NCYC`) that scales with
+`beta x sites` -- tens of seconds at L=16, minutes at L=32 low temperature. Two
+things made it invisible and are now fixed: the run prints a `calibrating...`
+notice up front, and `dla`'s output is line-buffered via `stdbuf` where
+available (standard on Linux clusters) so its own startup shows. If it truly
+never finishes, check for the pool message below.
+
+**Worldline pool overflow at low temperature.** DSQSS preallocates fixed pools
+of worldline segments and vertices (default 100000) and, on exhaustion, prints
+an error and calls `exit(0)` -- reporting *success*. At L=32 the equilibrium
+density crosses that default around `beta = 5`. The pools are now sized from
+`beta x sites` with headroom, so this should not arise; if it does, the run
+raises a clear error naming `nsegmax`/`nvermax` rather than silently producing a
+file with no `C^zz`. The larger pools cost ~130 MB at L=32, `beta = 8`, keeping
+total memory near 320 MB.
+
+## Troubleshooting
+
 **`RuntimeWarning: divide by zero / overflow / invalid value encountered in
 matmul`.** Spurious, and suppressed as of the current version. numpy built
 against Apple's Accelerate BLAS (the default on macOS via pip) leaves
