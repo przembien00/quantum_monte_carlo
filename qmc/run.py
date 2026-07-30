@@ -198,7 +198,6 @@ def run_dsqss(lat, beta, ntau, workdir, spin_sites=(0,), h_z=0.0, mc=None,
         command = ["stdbuf", "-oL", "-eL"] + command
     if progress:
         print(f"  {style.warn('calibrating')} "
-              f"(silent phase; scales with beta x sites, up to minutes at L=32)"
               f"...", file=out, flush=True)
     started = time.time()
 
